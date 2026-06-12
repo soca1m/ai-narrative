@@ -1,0 +1,32 @@
+# --- секреты (НИКОГДА не коммитить) ---
+.env
+.env.local
+web/.env.local
+*.key
+
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# --- сгенерированный runtime-стейт (содержит контент прогонов) ---
+narrative_state.db
+narrative_state.db-shm
+narrative_state.db-wal
+*.db
+
+# --- Node / Next ---
+web/node_modules/
+web/.next/
+web/out/
+node_modules/
+
+# --- прочее ---
+.DS_Store
+/tmp/
+
+# build-кэш
+web/tsconfig.tsbuildinfo
