@@ -145,6 +145,11 @@ export const setClaudeSubscription = (enabled: boolean, model?: string): Promise
   jpost("/api/claude/subscription", { enabled, model });
 export const setClaudeToken = (token: string): Promise<ClaudeStatus> =>
   jpost("/api/claude/token", { token });
+// OAuth-подключение подписки из веба: ссылка авторизации + обмен кода на токен
+export const claudeAuthUrl = (): Promise<{ authorized: boolean; url: string | null }> =>
+  fetch(`${API_BASE}/api/claude/auth_url`).then((r) => r.json());
+export const claudeExchange = (code: string): Promise<ClaudeStatus> =>
+  jpost("/api/claude/exchange", { code });
 
 export type ChatMsg = { role: "user" | "assistant"; content: string };
 export const chatWithEditor = (

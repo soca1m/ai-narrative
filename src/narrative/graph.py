@@ -131,13 +131,15 @@ def _next_chapter(state: State) -> dict:
     return {"chapter_idx": state["chapter_idx"] + 1}
 
 
-def sqlite_saver(path: str = "narrative_state.db") -> SqliteSaver:
+def sqlite_saver(path: str | None = None) -> SqliteSaver:
     """Персистентный checkpointer: state переживает краши и сессии.
 
     Это «общая память между агентами и сессиями» из требований. При обрыве
     (напр. 402 на редакторе) пайплайн резюмится с последнего шага — адалт и
     прочее не перегенерируются.
     """
+    import os  # noqa: PLC0415
+    path = path or os.environ.get("NARRATIVE_DB", "narrative_state.db")
     conn = sqlite3.connect(path, check_same_thread=False)
     return SqliteSaver(conn)
 

@@ -1,0 +1,36 @@
+# Поднимает весь стек: бэкенд (FastAPI+LangGraph) + фронтенд (Next.js).
+# Запуск:  docker compose up --build
+# UI:      http://localhost:3030
+#
+# Ключи и настройки берутся из .env (см. .env.example). Бэкенд наружу НЕ
+# публикуется — доступ только через фронт-прокси (same-origin, без CORS).
+
+services:
+  backend:
+    build: .
+    env_file: .env
+    environment:
+      # CORS под порт фронта (на случай прямых запросов из браузера).
+      CORS_ORIGINS: "http://localhost:3030,http://127.0.0.1:3030"
+    volumes:
+      # стейт прогонов переживает пересоздание контейнера
+      - narrative_data:/app/data
+      # ОПЦИОНАЛЬНО — Claude по подписке: проброс логина Claude Code (read-only).
+      # Закомментируй, если подписка не нужна (боты пойдут через OpenRouter).
+      - ${HOME}/.claude:/root/.claude:ro
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  frontend:
+    build: ./web
+    environment:
+      BACKEND_URL: "http://backend:8000"
+    ports:
+      - "3030:3000"     # UI наружу: http://localhost:3030
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  narrative_data:

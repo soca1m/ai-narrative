@@ -922,3 +922,74 @@ def claude_token(req: TokenReq):
         raise HTTPException(400, "пустой токен")
     _os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = tok
     return claude_status()
+
+
+# ---------- OAuth-подключение подписки прямо из веба ----------
+# Тот же флоу, что `claude setup-token`: открыть authorize-страницу в новой
+# вкладке → пользователь логинится → копирует выданный code → мы меняем его на
+# токен (PKCE). Публичный client_id Claude Code.
+
+_CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_CLAUDE_REDIRECT = "https://console.anthropic.com/oauth/code/callback"
+_CLAUDE_SCOPE = "org:create_api_key user:profile user:inference"
+_PKCE: dict[str, str] = {}  # verifier последнего запроса (один за раз)
+
+
+@app.get("/api/claude/auth_url")
+def claude_auth_url():
+    """Сгенерировать ссылку авторизации (PKCE) — для подключения или смены
+    аккаунта. Возвращаем всегда (даже если уже залогинен — чтобы можно было
+    переподключить другой аккаунт)."""
+    import base64
+    import hashlib
+    import secrets
+    from urllib.parse import urlencode
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    _PKCE["v"] = verifier
+    params = {
+        "code": "true", "client_id": _CLAUDE_CLIENT_ID,
+        "response_type": "code", "redirect_uri": _CLAUDE_REDIRECT,
+        "scope": _CLAUDE_SCOPE, "code_challenge": challenge,
+        "code_challenge_method": "S256", "state": verifier,
+    }
+    return {"authorized": False,
+            "url": "https://claude.ai/oauth/authorize?" + urlencode(params)}
+
+
+class CodeReq(BaseModel):
+    code: str
+
+
+@app.post("/api/claude/exchange")
+def claude_exchange(req: CodeReq):
+    """Обменять выданный code (формат code#state) на токен подписки."""
+    import httpx
+    raw = req.code.strip()
+    if not raw:
+        raise HTTPException(400, "пустой код")
+    code, _, state = raw.partition("#")
+    verifier = _PKCE.get("v")
+    if not verifier:
+        raise HTTPException(400, "сначала открой ссылку авторизации")
+    try:
+        r = httpx.post(
+            "https://console.anthropic.com/v1/oauth/token",
+            json={
+                "grant_type": "authorization_code", "code": code,
+                "state": state or verifier, "client_id": _CLAUDE_CLIENT_ID,
+                "redirect_uri": _CLAUDE_REDIRECT, "code_verifier": verifier,
+            }, timeout=30)
+    except Exception as exc:
+        raise HTTPException(502, f"сеть/обмен не удался: {str(exc)[:140]}")
+    if r.status_code != 200:
+        raise HTTPException(502, f"обмен не удался: {r.status_code} "
+                            f"{r.text[:140]}")
+    tok = (r.json() or {}).get("access_token")
+    if not tok:
+        raise HTTPException(502, "в ответе нет access_token")
+    import os as _os
+    _os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+    _PKCE.pop("v", None)
+    return claude_status()

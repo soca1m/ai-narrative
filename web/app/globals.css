@@ -447,6 +447,13 @@ button:disabled.xs { opacity: 0.7; }
 .sp-step { font-size: 11px; color: var(--paper-dim); margin: 6px 0 3px; }
 .sp-code { display: block; font-family: var(--font-mono); font-size: 12px; background: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; color: var(--ember-soft); user-select: all; }
 .sp-note { font-size: 10px; color: var(--muted); margin-top: 6px; line-height: 1.4; }
+.sp-authlink {
+  display: block; text-align: center; margin: 2px 0 9px; padding: 9px 11px;
+  border-radius: 7px; background: var(--ember); color: #1b1109;
+  font-size: 12px; font-weight: 600; text-decoration: none;
+  word-break: break-all;
+}
+.sp-authlink:hover { filter: brightness(1.08); }
 .model-select { width: 100%; background: var(--ink); color: var(--paper); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font-family: inherit; font-size: 12px; }
 
 /* review-gate в сайдбаре */

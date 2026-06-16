@@ -15,6 +15,8 @@ import {
   applyRevision,
   exportProject,
   claudeStatus,
+  claudeAuthUrl,
+  claudeExchange,
   setClaudeSubscription,
   setClaudeToken,
   adaptAdult,
@@ -1128,6 +1130,30 @@ function ClaudeSubPanel() {
     try { setS(await setClaudeToken(token.trim())); setToken(""); setShowAuth(false); }
     finally { setBusy(false); }
   }
+  const [authErr, setAuthErr] = useState<string | null>(null);
+  const [authLink, setAuthLink] = useState<string | null>(null);
+  // получить OAuth-ссылку и показать её в меню (window.open после await блочит
+  // попап-блокер — поэтому даём кликабельную ссылку, юзер откроет сам)
+  async function connectOauth() {
+    setBusy(true); setAuthErr(null);
+    try {
+      const r = await claudeAuthUrl();
+      if (r.authorized) { setAuthLink(null); setShowAuth(false); await load(); return; }
+      setAuthLink(r.url ?? null);
+      setShowAuth(true);
+      if (r.url) { try { window.open(r.url, "_blank", "noopener,noreferrer"); } catch {} }
+    } catch (e) {
+      setAuthErr(e instanceof Error ? e.message : "не удалось получить ссылку");
+      setShowAuth(true);
+    } finally { setBusy(false); }
+  }
+  async function exchangeCode() {
+    if (!token.trim()) return;
+    setBusy(true); setAuthErr(null);
+    try { setS(await claudeExchange(token.trim())); setToken(""); setShowAuth(false); }
+    catch (e) { setAuthErr(e instanceof Error ? e.message : "обмен не удался"); }
+    finally { setBusy(false); }
+  }
 
   return (
     <div className="subpanel">
@@ -1154,21 +1180,35 @@ function ClaudeSubPanel() {
         <option value="opus">Opus — максимум</option>
       </select>
 
-      <button className="small ghost" style={{ marginTop: 8 }} onClick={() => setShowAuth((v) => !v)}>
-        {s?.authorized ? "Обновить авторизацию" : "Подключить подписку"}
-      </button>
+      {!s?.authorized ? (
+        <button className="small" style={{ marginTop: 8 }} disabled={busy} onClick={connectOauth}>
+          {busy ? "…" : "🔗 Авторизоваться (откроется вкладка)"}
+        </button>
+      ) : (
+        <button className="small ghost" style={{ marginTop: 8 }} disabled={busy} onClick={connectOauth}>
+          Сменить аккаунт
+        </button>
+      )}
       {showAuth && (
         <div className="sp-auth">
-          <div className="sp-step">1. В терминале выполни:</div>
-          <code className="sp-code">claude setup-token</code>
-          <div className="sp-step">2. Откроется браузер → авторизуйся в Claude → скопируй выданный токен.</div>
-          <div className="sp-step">3. Вставь токен сюда:</div>
-          <textarea rows={2} value={token} placeholder="sk-ant-oat… (токен из setup-token)"
+          {authLink && (
+            <a className="sp-authlink" href={authLink} target="_blank" rel="noopener noreferrer">
+              🔗 Открыть страницу авторизации Claude
+            </a>
+          )}
+          <div className="sp-step">1. Открой ссылку выше, войди в Claude и подтверди доступ.</div>
+          <div className="sp-step">2. Скопируй выданный код и вставь сюда:</div>
+          <textarea rows={2} value={token} placeholder="код авторизации (вид code#state)"
             onChange={(e) => setToken(e.target.value)} />
-          <button className="small" disabled={busy || !token.trim()} onClick={saveToken}>
-            {busy ? "…" : "Подключить токен"}
+          <button className="small" disabled={busy || !token.trim()} onClick={exchangeCode}>
+            {busy ? "…" : "Подключить"}
           </button>
-          <div className="sp-note">Если ты уже залогинен в Claude Code — токен не нужен, подписка уже работает.</div>
+          {authErr && <div className="sp-warn">⚠ {authErr}</div>}
+          <div className="sp-note">
+            Альтернатива: вставь долгоживущий токен из <code>claude setup-token</code> и нажми
+            {" "}<button className="xs ghost" disabled={busy || !token.trim()} onClick={saveToken}>как токен</button>.
+            Если уже залогинен в Claude Code — подписка работает без этого.
+          </div>
         </div>
       )}
     </div>

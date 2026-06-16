@@ -1,0 +1,15 @@
+# Бэкенд-образ: не тащим лишнее в контекст
+.venv/
+__pycache__/
+*.pyc
+.git/
+.env
+*.db
+*.db-shm
+*.db-wal
+*.db.old
+web/
+docs/
+scripts/__pycache__/
+.playwright-mcp/
+narrative_state.db*
