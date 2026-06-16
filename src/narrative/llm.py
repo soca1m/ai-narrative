@@ -34,6 +34,17 @@ class LLM:
         )
         return resp.choices[0].message.content or ""
 
+    def chat(self, system: str, messages: list[dict],
+             temperature: Optional[float] = None) -> str:
+        """Многоходовый диалог (чат с ИИ-редактором в UI)."""
+        resp = self._client.chat.completions.create(
+            model=self.cfg.model,
+            temperature=self.cfg.temperature if temperature is None else temperature,
+            messages=[{"role": "system", "content": system}, *messages],
+            **self._max_tokens_kwarg(),
+        )
+        return resp.choices[0].message.content or ""
+
     def _max_tokens_kwarg(self) -> dict:
         """max_tokens<=0 → не шлём лимит (модель пишет до своего предела).
         Нужно адалту: сцены «уровня C» длинные, жёсткий cap режет кульминацию."""

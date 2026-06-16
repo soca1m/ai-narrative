@@ -4,40 +4,91 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Chapter,
+  ChatMsg,
   EditorReport,
   Finding,
   FindingStatus,
+  ClaudeStatus,
   NarrativeState,
+  chatWithEditor,
+  applyChatToChapter,
+  applyRevision,
+  exportProject,
+  claudeStatus,
+  setClaudeSubscription,
+  setClaudeToken,
   adaptAdult,
   decideFinding,
   getState,
   patchState,
   resumeRun,
   reviseChapter,
+  rewriteDialogue,
+  syncPlan,
   reviseStage,
   rollback,
   selectLogline,
   skipAdult,
   startRun,
-  structureMore,
-  structureProceed,
+  setChapterCount,
+  setStepMode as apiSetStep,
 } from "../lib/api";
 
 const STAGES: [string, string, string][] = [
   ["logline", "Логлайн", "01"],
   ["synopsis", "Синопсис", "02"],
   ["characters", "Персонажи", "03"],
-  ["structure", "Структура", "04"],
-  ["dialogue", "Диалоги", "05"],
-  ["adult", "Адалт", "06"],
-  ["editor", "Редактор", "07"],
-  ["translation", "Перевод", "08"],
+  ["chapter_count", "Объём", "04"],
+  ["structure", "Структура", "05"],
+  ["structure_editor", "Ред. структуры", "06"],
+  ["dialogue", "Диалоги + Адалт", "07"],
+  ["editor", "Редактор", "08"],
+  ["translation", "Перевод", "09"],
 ];
+
+// что сейчас сгенерируется — для ghost-превью следующего этапа
+const STAGE_DESC: Record<string, string> = {
+  logline: "Бот придумает несколько вариантов логлайна — выберешь один.",
+  synopsis: "Развёрнутый синопсис на основе выбранного логлайна.",
+  characters: "Карточки персонажей: внешность, характер, мотивации (канон).",
+  chapter_count: "ИИ оценит и предложит оптимальное число глав.",
+  structure: "Поглавный план: что в каждой главе + где адалт-точки.",
+  structure_editor: "Редактор проверит и сам починит план до написания.",
+  dialogue: "Бот напишет диалоги глав (адалт — внутри сцены).",
+  editor: "Редактор проверит готовые главы и предложит правки.",
+  translation: "Перевод глав на выбранный язык.",
+};
 
 const BOT_NAME: Record<number, string> = {
   1: "Логлайн", 2: "Синопсис", 3: "Персонажи", 4: "Структура",
   5: "Диалоги", 6: "Адалт", 7: "Редактор", 8: "Перевод",
 };
+
+// человекочитаемое имя следующего шага (узлы графа, включая служебные) —
+// чтобы кнопка «Продолжить» не показывала технический id вроде structure_editor
+const NODE_LABEL: Record<string, string> = {
+  logline: "Логлайн", synopsis: "Синопсис", characters: "Персонажи",
+  chapter_count: "Объём истории", structure: "Структуру",
+  structure_editor: "Проверку структуры", dialogue: "Написание глав",
+  editor: "Проверку главы редактором", translation: "Перевод",
+  content_next: "Следующую главу", edit_start: "Проверку редактором",
+  edit_next: "Следующую главу", edit_router: "Следующий шаг",
+  revise_to_dialogue: "Правку главы", bump_retry: "Правку главы",
+};
+function nextLabel(next: string[]): string {
+  const n = next[0];
+  return (n && NODE_LABEL[n]) || "далее";
+}
+
+// скачать текст файлом на стороне браузера
+function downloadText(filename: string, text: string) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
 
 type Ev = { i: number; kind: string; bot: number; chapter: number | null; text: string };
 
@@ -131,19 +182,21 @@ export default function Page() {
   );
   const [genre, setGenre] = useState("");
   const [lang, setLang] = useState("Russian");
-  const [batch, setBatch] = useState(3);
   const [translation, setTranslation] = useState(false);
   const [stepMode, setStepMode] = useState(true);
 
   const [threadId, setThreadId] = useState<string | null>(null);
   const [status, setStatus] = useState("idle");
   const [next, setNext] = useState<string[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+  const [applyingRev, setApplyingRev] = useState(false);
   const [st, setSt] = useState<NarrativeState>({});
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [dirty, setDirty] = useState<Set<string>>(new Set());
   const [saved, setSaved] = useState<string | null>(null);
+  const [countInput, setCountInput] = useState<number | "">("");
 
   const events = useMemo(() => classifyLog(st.log ?? []), [st.log]);
   const rollbackTick = useMemo(
@@ -155,7 +208,10 @@ export default function Page() {
     setDrafts((prev) => {
       const d = { ...prev };
       for (const k of ["synopsis", "characters"] as const) {
-        if (!dirty.has(k) && typeof s[k] === "string") d[k] = s[k] as string;
+        if (dirty.has(k)) continue;
+        // строка из state → в черновик; пусто/None (после отката) → очищаем,
+        // иначе блок не исчезает (EditableCard скрывается при пустом value).
+        d[k] = typeof s[k] === "string" ? (s[k] as string) : "";
       }
       return d;
     });
@@ -166,7 +222,7 @@ export default function Page() {
     setDirty(new Set());
     const { thread_id } = await startRun({
       theme, genre: genre || undefined, target_language: lang,
-      chapters_per_batch: batch, translation_enabled: translation, step_mode: stepMode,
+      translation_enabled: translation, step_mode: stepMode,
     });
     setThreadId(thread_id);
     poll(thread_id);
@@ -179,6 +235,7 @@ export default function Page() {
         const r = await getState(id);
         setStatus(r.status);
         setNext(r.next);
+        setErr(r.error || null);
         setSt(r.state);
         syncDrafts(r.state);
         if (r.status === "running" || r.status === "idle")
@@ -220,14 +277,33 @@ export default function Page() {
     logline: !!st.loglines?.length,
     synopsis: !!st.synopsis,
     characters: !!st.characters,
+    chapter_count: (st.suggested_chapters ?? 0) > 0 || (st.target_chapters ?? 0) > 0,
     structure: !!st.chapters?.length,
+    structure_editor: Array.isArray(st.structure_fixes),
     dialogue: !!st.chapters?.some((c) => c.dialogue),
     adult: !!st.chapters?.some((c) => c.adult_scene),
     editor: !!st.editor_reports?.length,
     translation: !!st.chapters?.some((c) => c.translation),
   };
   const activeStage = next[0] ?? null;
-  const pausedAtStructure = status === "paused" && activeStage === "structure";
+  // апрув числа глав: chapter_count предложил, структуры ещё нет
+  const pausedAtCount = status === "paused"
+    && (st.suggested_chapters ?? 0) > 0 && !st.chapters?.length;
+
+  // Текущий этап = последний, у которого есть результат. Кнопка «Откат»
+  // показывается ТОЛЬКО на нём: удаляет его результат и ставит пайплайн на
+  // регенерацию этого этапа (зависимые этапы очищаются на бэке).
+  const currentStage: string | null = has.dialogue
+    ? "dialogue"
+    : has.structure
+    ? "structure"
+    : has.characters
+    ? "characters"
+    : has.synopsis
+    ? "synopsis"
+    : has.logline
+    ? "logline"
+    : null;
 
   const totalRevisions = Object.values(st.retry_count ?? {}).reduce((a, b) => a + b, 0);
   const reports = st.editor_reports ?? [];
@@ -238,12 +314,55 @@ export default function Page() {
   const botsRun = new Set(events.filter((e) => e.bot).map((e) => e.bot)).size;
   const busy = status === "running";
 
+  // --- поглавный review-gate: текущая глава должна быть исправлена ПОЛНОСТЬЮ ---
+  const curIdx = st.chapter_idx ?? 0;
+  const curReport = [...reports].reverse().find((r) => r.chapter_index === curIdx);
+  // глава проверена редактором (есть отчёт по ней)
+  const curEdited = !!curReport;
+  // все НЕотклонённые замечания (любой важности) — пока есть, дальше нельзя
+  const curOpenAll = curReport
+    ? curReport.findings.filter((f) => f.status !== "rejected").length
+    : 0;
+  const curOpenCrit = curReport
+    ? curReport.findings.filter((f) => f.severity === "critical" && f.status !== "rejected").length
+    : 0;
+  // gate: на паузе текущая глава проверена и остались открытые замечания.
+  // Переход к следующей главе блокируется, пока их не закрыть (исправить/отклонить).
+  const gating = status === "paused" && curEdited && curOpenAll > 0;
+
+  // проект готов: граф дошёл до конца (перевод/END). Все главы написаны →
+  // можно скачивать в любой момент. Готовность снимает «ощущение бесконечности».
+  const allWritten = (st.chapters?.length ?? 0) > 0
+    && (st.chapters ?? []).every((c) => !!c.dialogue);
+  const projectDone = status === "done";
+
+  async function onDownload(fmt: "txt" | "md") {
+    if (!threadId) return;
+    try {
+      const r = await exportProject(threadId, fmt);
+      downloadText(r.filename, r.text);
+    } catch {
+      setErr("Не удалось собрать проект для скачивания");
+    }
+  }
+
+  // единый перехват ошибок действий: показываем в баннере, НЕ роняем UI.
+  // Долгие операции теперь фоновые → refresh запускает поллинг (running→paused).
+  async function guard(fn: () => Promise<void>) {
+    try {
+      setErr(null);
+      await fn();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Ошибка операции");
+    }
+  }
+
   return (
     <div className="shell">
       {/* RAIL */}
       <aside className="rail">
         <div className="brand"><span className="dot" /> ai-narrative</div>
-        <div className="tagline">КОМНАТА СЦЕНАРИСТОВ · 8 БОТОВ · 18+</div>
+        <div className="tagline">КОМНАТА СЦЕНАРИСТОВ · АДАЛТ В ДИАЛОГАХ · 18+</div>
 
         <label>Тема и референсы</label>
         <textarea rows={4} value={theme} onChange={(e) => setTheme(e.target.value)} />
@@ -252,9 +371,6 @@ export default function Page() {
           placeholder="напр. комедийная драма" />
         <label>Язык</label>
         <input type="text" value={lang} onChange={(e) => setLang(e.target.value)} />
-        <label>Глав за порцию (структура пишется частями)</label>
-        <input type="number" min={1} max={10} value={batch}
-          onChange={(e) => setBatch(Math.max(1, +e.target.value || 1))} />
         <div className="check">
           <input id="tr" type="checkbox" checked={translation}
             onChange={(e) => setTranslation(e.target.checked)} />
@@ -262,9 +378,15 @@ export default function Page() {
         </div>
         <div className="check">
           <input id="step" type="checkbox" checked={stepMode}
-            onChange={(e) => setStepMode(e.target.checked)} />
-          <label htmlFor="step" className="inline">Пошаговый режим — пауза после каждого бота</label>
+            onChange={(e) => {
+              const v = e.target.checked;
+              setStepMode(v);
+              if (threadId) apiSetStep(threadId, v).then(() => poll(threadId));
+            }} />
+          <label htmlFor="step" className="inline">Пошаговый режим — пауза после каждого бота (можно менять на лету)</label>
         </div>
+        <ClaudeSubPanel />
+
         <button className="wide" onClick={onStart} disabled={busy}>
           {threadId ? "↻ Запустить заново" : "▶ Запустить пайплайн"}
         </button>
@@ -273,25 +395,84 @@ export default function Page() {
           <>
             <div className="statusbar">
               <span className={`tally ${status}`}>{status}</span>
-              {next.length > 0 && <span className="next-chip">→ {next.join(", ")}</span>}
-              <button className="ghost small" onClick={refresh}>⟳</button>
+              {next.length > 0 && <span className="next-chip">→ {nextLabel(next)}</span>}
             </div>
-            {status === "paused" && !pausedAtStructure && (
+            {err && (
+              <div className="errbox">
+                <div className="errt">⚠ Ошибка</div>
+                <div className="errm">{err}</div>
+                {status === "error"
+                  ? <button className="wide" onClick={() => { setErr(null); onResume(); }}>↻ Повторить</button>
+                  : <button className="wide ghost" onClick={() => setErr(null)}>Закрыть</button>}
+              </div>
+            )}
+            {busy && (
+              <div className="working">
+                <span className="wk-dot" />
+                ИИ работает… {curEdited
+                  ? `правка главы ${curIdx + 1}`
+                  : nextLabel(next).toLowerCase()}
+              </div>
+            )}
+            {status === "paused" && !pausedAtCount && !gating && (
               <button className="wide" onClick={onResume}>
-                ⏭ Продолжить — {next.join(", ") || "далее"}
+                {curEdited
+                  ? `✓ Глава ${curIdx + 1} готова — следующая`
+                  : `⏭ Продолжить · ${nextLabel(next)}`}
               </button>
             )}
-            {pausedAtStructure && (
+            {gating && (
+              <div className="gate">
+                <div className="gate-t">🔎 Редактор · глава {curIdx + 1}</div>
+                <div className="gate-h">
+                  {curOpenAll} незакрыт{curOpenAll === 1 ? "ое замечание" : "ых замечаний"}
+                  {curOpenCrit > 0 ? ` (из них ${curOpenCrit} критич.)` : ""}.
+                  Исправь или отклони каждое — пока глава не доведена, к следующей
+                  не перейти.
+                </div>
+                <button className="wide" disabled={applyingRev || busy}
+                  onClick={async () => {
+                    if (!threadId) return;
+                    setApplyingRev(true);
+                    try {
+                      setErr(null);
+                      // учитываем обсуждение из чата ТЕКУЩЕЙ ревизии (если был)
+                      const round = reports.filter((r) => r.chapter_index === curIdx).length;
+                      let msgs: ChatMsg[] = [];
+                      try {
+                        const v = localStorage.getItem(`chat:${threadId}:c${curIdx}:r${round}`);
+                        if (v) msgs = JSON.parse(v);
+                      } catch {}
+                      await applyRevision(threadId, curIdx, msgs);
+                      refresh();  // poll подхватит status=running
+                    } catch (e) {
+                      setErr(e instanceof Error ? e.message : "Ошибка применения правок");
+                    } finally {
+                      setApplyingRev(false);
+                    }
+                  }}>
+                  {applyingRev ? "⏳ Запускаю правку…" : "✓ Исправить всё и перепроверить"}
+                </button>
+              </div>
+            )}
+            {pausedAtCount && (
               <div className="batch-ctl">
                 <div className="hint">
-                  Структура: {st.chapters?.length ?? 0} глав
-                  {st.structure_done ? " · история завершена" : " · порция готова"}
+                  📖 ИИ предлагает <b>{st.suggested_chapters}</b> глав.
+                  {st.count_reason ? <><br />{st.count_reason}</> : null}
                 </div>
-                <button className="wide" onClick={async () => { await structureMore(threadId); setStatus("running"); poll(threadId); }}>
-                  ＋ Ещё порцию ({batch} глав)
-                </button>
-                <button className="wide alt" onClick={async () => { await structureProceed(threadId); setStatus("running"); poll(threadId); }}>
-                  ✍ Перейти к написанию
+                <div className="row" style={{ gap: 8 }}>
+                  <input type="number" min={2} max={30}
+                    placeholder={String(st.suggested_chapters ?? "")}
+                    value={countInput}
+                    onChange={(e) => setCountInput(e.target.value === "" ? "" : Math.max(2, +e.target.value))} />
+                </div>
+                <button className="wide" onClick={async () => {
+                  const n = countInput || st.suggested_chapters || 6;
+                  await setChapterCount(threadId, n);
+                  setStatus("running"); setCountInput(""); poll(threadId);
+                }}>
+                  ✓ Писать {countInput || st.suggested_chapters} глав
                 </button>
               </div>
             )}
@@ -325,6 +506,23 @@ export default function Page() {
 
         {threadId && (
           <>
+            {projectDone && (
+              <motion.div className="proj-done" initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}>
+                <div className="done-t">✅ Проект готов</div>
+                <div className="done-d">
+                  Все {st.chapters?.length ?? 0} глав написаны и проверены
+                  редактором. Можно скачать готовый текст новеллы.
+                </div>
+                <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
+                  <button onClick={() => onDownload("txt")}>📥 Скачать .txt</button>
+                  <button className="ghost" onClick={() => onDownload("md")}>
+                    📥 Скачать .md
+                  </button>
+                </div>
+              </motion.div>
+            )}
+
             <div className="pipeline">
               {STAGES.map(([k, label, ix]) => {
                 const off = k === "translation" && !st.translation_enabled;
@@ -337,6 +535,38 @@ export default function Page() {
               })}
             </div>
 
+            {/* ghost-превью: что сейчас генерируется / появится следующим */}
+            {activeStage && STAGE_DESC[activeStage] && !has[activeStage] && (
+              <motion.div className="ghost" layout
+                initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}>
+                <span className={`ghost-dot ${status === "running" ? "live" : ""}`} />
+                <div>
+                  <div className="ghost-t">
+                    {status === "running" ? "Сейчас генерируется" : "Далее"}:{" "}
+                    {STAGES.find((s) => s[0] === activeStage)?.[1] ?? activeStage}
+                  </div>
+                  <div className="ghost-d">{STAGE_DESC[activeStage]}</div>
+                </div>
+              </motion.div>
+            )}
+
+            {(st.chapters?.length ?? 0) > 0 && !projectDone && (
+              <div className={`phasebar ${gating || curOpenCrit > 0 ? "edit" : "content"}`}>
+                <span className="ph-dot" />
+                {`Глава ${curIdx + 1} из ${st.chapters!.length} · `}
+                {curEdited
+                  ? (gating ? "правки редактора — довести до конца" : "проверена")
+                  : "написание (диалоги + адалт), затем проверка редактором"}
+              </div>
+            )}
+
+            {(st.structure_fixes?.length ?? 0) > 0 && (
+              <div className="sfixes">
+                <div className="sft">🛠 Редактор структуры исправил план ({st.structure_fixes!.length}):</div>
+                {st.structure_fixes!.map((fx, i) => <div key={i} className="sfi">· {fx}</div>)}
+              </div>
+            )}
+
             <div className="stats">
               <Stat v={st.chapters?.length ?? 0} k="главы" />
               <Stat v={botsRun} k="ботов" />
@@ -347,40 +577,51 @@ export default function Page() {
             {/* Порядок убывания: свежие результаты сверху (главы → персонажи → синопсис → логлайн) */}
             <Chapters
               threadId={threadId}
+              phase={st.phase}
+              activeIdx={curIdx}
+              onRefresh={refresh}
+              busy={busy}
+              canDownload={allWritten}
+              onDownload={onDownload}
               chapters={st.chapters ?? []}
               reports={reports}
-              onSaveAll={async (chs) => { if (threadId) { await patchState(threadId, { chapters: chs }); refresh(); } }}
-              onReviseChapter={async (i, fb) => { if (threadId) { await reviseChapter(threadId, i, fb); refresh(); } }}
-              onRollbackWriting={async () => { if (threadId && confirm("Сбросить все написанные тексты глав (диалоги/адалт/перевод) и начать написание заново? План глав сохранится.")) { await rollback(threadId, "dialogue"); refresh(); } }}
-              onDecide={async (fid, body) => { if (threadId) { await decideFinding(threadId, fid, body); refresh(); } }}
-              onAdaptAdult={async (i) => { if (threadId) { await adaptAdult(threadId, i); refresh(); } }}
-              onSkipAdult={async (i) => { if (threadId) { await skipAdult(threadId, i); refresh(); } }}
+              onSaveAll={(chs) => guard(async () => { if (threadId) { await patchState(threadId, { chapters: chs }); refresh(); } })}
+              onReviseChapter={(i, fb) => guard(async () => { if (threadId) { await reviseChapter(threadId, i, fb); refresh(); } })}
+              onRewriteDialogue={(i) => guard(async () => { if (threadId) { await rewriteDialogue(threadId, i); refresh(); } })}
+              onSyncPlan={(i) => guard(async () => { if (threadId) { await syncPlan(threadId, i); refresh(); } })}
+              rollbackStage={currentStage === "dialogue" ? "dialogue" : currentStage === "structure" ? "structure" : null}
+              onRollbackWriting={() => guard(async () => { if (threadId && confirm("Откатить этап написания: удалить все тексты глав (диалоги/адалт/перевод) и сгенерировать заново? План глав сохранится.")) { await rollback(threadId, "dialogue"); refresh(); } })}
+              onRollbackStructure={() => guard(async () => { if (threadId && confirm("Откатить этап структуры: удалить план глав и сгенерировать заново?")) { await rollback(threadId, "structure"); refresh(); } })}
+              onDecide={(fid, body) => guard(async () => { if (threadId) { await decideFinding(threadId, fid, body); refresh(); } })}
+              onAdaptAdult={(i) => guard(async () => { if (threadId) { await adaptAdult(threadId, i); refresh(); } })}
+              onSkipAdult={(i) => guard(async () => { if (threadId) { await skipAdult(threadId, i); refresh(); } })}
             />
 
             {/* Персонажи */}
             <EditableCard
-              title="Персонажи · карточки = канон" bot="03" rows={12} valKey="characters"
+              title="Персонажи · карточки = канон" bot="03" rows={12} valKey="characters" busy={busy}
               value={drafts.characters ?? ""} dirty={dirty.has("characters")} saved={saved === "characters"}
               onChange={(v) => edit("characters", v)} onSave={() => save("characters")}
-              onRevise={async (fb) => { if (threadId) { await reviseStage(threadId, "characters", fb); refresh(); } }}
-              onRollback={async () => { if (threadId && confirm("Откатиться к персонажам? Все главы будут сброшены и перегенерированы.")) { await rollback(threadId, "characters"); refresh(); } }}
+              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "characters", fb); refresh(); } })}
+              onRollback={currentStage === "characters" ? () => guard(async () => { if (threadId && confirm("Откатить этап персонажей: удалить карточки и сгенерировать заново?")) { await rollback(threadId, "characters"); refresh(); } }) : undefined}
             />
 
             {/* Синопсис */}
             <EditableCard
-              title="Синопсис" bot="02" rows={10} valKey="synopsis"
+              title="Синопсис" bot="02" rows={10} valKey="synopsis" busy={busy}
               value={drafts.synopsis ?? ""} dirty={dirty.has("synopsis")} saved={saved === "synopsis"}
               onChange={(v) => edit("synopsis", v)} onSave={() => save("synopsis")}
-              onRevise={async (fb) => { if (threadId) { await reviseStage(threadId, "synopsis", fb); refresh(); } }}
-              onRollback={async () => { if (threadId && confirm("Откатиться к синопсису? Персонажи и все главы будут сброшены и перегенерированы.")) { await rollback(threadId, "synopsis"); refresh(); } }}
+              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "synopsis", fb); refresh(); } })}
+              onRollback={currentStage === "synopsis" ? () => guard(async () => { if (threadId && confirm("Откатить этап синопсиса: удалить синопсис и сгенерировать заново?")) { await rollback(threadId, "synopsis"); refresh(); } }) : undefined}
             />
 
             {/* Логлайн — выбор одного из вариантов */}
             <LoglineCard
               loglines={st.loglines ?? []}
               selected={st.selected_logline ?? ""}
-              onSelect={async (l) => { if (threadId) { await selectLogline(threadId, l); refresh(); } }}
-              onRevise={async (fb) => { if (threadId) { await reviseStage(threadId, "logline", fb); refresh(); } }}
+              busy={busy}
+              onSelect={(l) => guard(async () => { if (threadId) { await selectLogline(threadId, l); refresh(); } })}
+              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "logline", fb); refresh(); } })}
             />
           </>
         )}
@@ -395,18 +636,20 @@ function Stat({ v, k, cls }: { v: number; k: string; cls?: string }) {
   );
 }
 
-// строка ввода «попроси ИИ переделать»
-function ReviseBox({ label, onRevise }: { label?: string; onRevise: (fb: string) => Promise<void> }) {
+// строка ввода «попроси ИИ переделать». disabled — пока ИИ работает (no 409)
+function ReviseBox({ label, onRevise, disabled }: {
+  label?: string; onRevise: (fb: string) => Promise<void>; disabled?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const [fb, setFb] = useState("");
   const [busy, setBusy] = useState(false);
-  if (!open) return <button className="small ghost" onClick={() => setOpen(true)}>✦ {label ?? "Попросить ИИ переделать"}</button>;
+  if (!open) return <button className="small ghost" disabled={disabled} onClick={() => setOpen(true)}>✦ {label ?? "Попросить ИИ переделать"}</button>;
   return (
     <div className="revise">
       <textarea rows={2} placeholder="Что изменить? напр. «больше внутреннего конфликта у героя»"
         value={fb} onChange={(e) => setFb(e.target.value)} />
       <div className="row">
-        <button className="small" disabled={!fb.trim() || busy}
+        <button className="small" disabled={!fb.trim() || busy || disabled}
           onClick={async () => { setBusy(true); try { await onRevise(fb); setFb(""); setOpen(false); } finally { setBusy(false); } }}>
           {busy ? "…" : "Переделать"}
         </button>
@@ -417,9 +660,9 @@ function ReviseBox({ label, onRevise }: { label?: string; onRevise: (fb: string)
 }
 
 function LoglineCard({
-  loglines, selected, onSelect, onRevise,
+  loglines, selected, onSelect, onRevise, busy,
 }: {
-  loglines: string[]; selected: string;
+  loglines: string[]; selected: string; busy?: boolean;
   onSelect: (l: string) => void; onRevise: (fb: string) => Promise<void>;
 }) {
   if (!loglines.length) return null;
@@ -429,21 +672,21 @@ function LoglineCard({
       <div className="loglines">
         {loglines.map((l, i) => (
           <label key={i} className={`logline ${selected === l ? "sel" : ""}`}>
-            <input type="radio" name="logline" checked={selected === l} onChange={() => onSelect(l)} />
+            <input type="radio" name="logline" disabled={busy} checked={selected === l} onChange={() => onSelect(l)} />
             <span>{l}</span>
           </label>
         ))}
       </div>
-      <ReviseBox label="Сгенерировать другие логлайны" onRevise={onRevise} />
+      <ReviseBox label="Сгенерировать другие логлайны" onRevise={onRevise} disabled={busy} />
     </div>
   );
 }
 
 function EditableCard(props: {
-  title: string; bot: string; rows: number; valKey: string;
+  title: string; bot: string; rows: number; valKey: string; busy?: boolean;
   value: string; dirty: boolean; saved: boolean;
   onChange: (v: string) => void; onSave: () => void;
-  onRevise: (fb: string) => Promise<void>; onRollback: () => Promise<void>;
+  onRevise: (fb: string) => Promise<void>; onRollback?: () => Promise<void>;
 }) {
   if (!props.value && !props.dirty) return null;
   return (
@@ -452,37 +695,91 @@ function EditableCard(props: {
         <span className="t"><span className="botnum">{props.bot}</span>{props.title}</span>
         <span className="row">
           {props.saved && <span className="saved">✓ сохранено</span>}
-          <button className="small" disabled={!props.dirty} onClick={props.onSave}>Сохранить</button>
-          <button className="small ghost" onClick={props.onRollback} title="Откатиться и перегенерировать с этого этапа">↩ Откат</button>
+          <button className="small" disabled={!props.dirty || props.busy} onClick={props.onSave}>Сохранить</button>
+          {props.onRollback && (
+            <button className="small ghost" disabled={props.busy} onClick={props.onRollback}
+              title="Удалить результат этого этапа и сгенерировать заново">↩ Откат</button>
+          )}
         </span>
       </div>
       <textarea rows={props.rows} value={props.value} onChange={(e) => props.onChange(e.target.value)} />
-      <ReviseBox onRevise={props.onRevise} />
+      <ReviseBox onRevise={props.onRevise} disabled={props.busy} />
     </div>
   );
 }
 
 function Chapters(props: {
   threadId: string;
+  phase?: string; activeIdx?: number; busy?: boolean;
   chapters: Chapter[]; reports: EditorReport[];
+  canDownload?: boolean;
+  onDownload?: (fmt: "txt" | "md") => void;
   onSaveAll: (chs: Chapter[]) => void;
   onReviseChapter: (i: number, fb: string) => Promise<void>;
+  onRewriteDialogue: (i: number) => Promise<void>;
+  onSyncPlan: (i: number) => Promise<void>;
+  onRefresh: () => void;
+  rollbackStage: "dialogue" | "structure" | null;
   onRollbackWriting: () => Promise<void>;
+  onRollbackStructure: () => Promise<void>;
   onDecide: (fid: string, body: { status?: FindingStatus; comment?: string; judge?: boolean }) => Promise<void>;
   onAdaptAdult: (i: number) => Promise<void>;
   onSkipAdult: (i: number) => Promise<void>;
 }) {
-  const [draft, setDraft] = useState<Chapter[]>(props.chapters);
-  const [dirty, setDirty] = useState(false);
+  // overrides-модель: рендерим из серверных props.chapters, локально храним
+  // ТОЛЬКО изменённые поля (ключ `${index}.${field}`). Поэтому новые главы/
+  // диалоги с сервера видны сразу, а ручные правки не теряются (нет залипания).
+  const [edits, setEdits] = useState<Record<string, string>>({});
   const [activeFinding, setActiveFinding] = useState<string | null>(null);
   const [adapting, setAdapting] = useState<number | null>(null);
-  useEffect(() => { if (!dirty) setDraft(props.chapters); }, [props.chapters, dirty]);
-  if (!draft.length) return null;
+  const [working, setWorking] = useState<string | null>(null);
+  const [toggled, setToggled] = useState<Record<number, boolean>>({});
+  const dirty = Object.keys(edits).length > 0;
+  if (!props.chapters.length) return null;
 
-  function upd(chIndex: number, patch: Partial<Chapter>) {
-    // ключ — c.index (главы рендерятся в обратном порядке, позиция != индекс)
-    setDraft((d) => d.map((c) => (c.index === chIndex ? { ...c, ...patch } : c)));
-    setDirty(true);
+  // сколько открытых критичных у главы (последний отчёт редактора)
+  function critOpen(idx: number): number {
+    const rs = props.reports.filter((r) => r.chapter_index === idx);
+    const last = rs[rs.length - 1];
+    return last ? last.findings.filter((f) => f.severity === "critical" && f.status !== "rejected").length : 0;
+  }
+  // все НЕзакрытые замечания (любой важности) — глава доведена, когда их 0
+  function openAll(idx: number): number {
+    const rs = props.reports.filter((r) => r.chapter_index === idx);
+    const last = rs[rs.length - 1];
+    return last ? last.findings.filter((f) => f.status !== "rejected").length : 0;
+  }
+  // аккордеон: авто-раскрыта глава, требующая внимания (есть замечания / активная),
+  // остальные свёрнуты; клик по шапке переопределяет.
+  function isOpen(idx: number): boolean {
+    if (idx in toggled) return toggled[idx];
+    return openAll(idx) > 0 || idx === props.activeIdx;
+  }
+  const toggle = (idx: number) =>
+    setToggled((t) => ({ ...t, [idx]: !isOpen(idx) }));
+
+  const val = (idx: number, field: string, server: string | null) => {
+    const k = `${idx}.${field}`;
+    return k in edits ? edits[k] : (server ?? "");
+  };
+  const upd = (idx: number, field: string, value: string) =>
+    setEdits((e) => ({ ...e, [`${idx}.${field}`]: value }));
+  function buildMerged(): Chapter[] {
+    return props.chapters.map((c) => ({
+      ...c,
+      plan: val(c.index, "plan", c.plan),
+      dialogue: c.dialogue == null ? null : val(c.index, "dialogue", c.dialogue),
+      adult_scene: c.adult_scene == null ? null : val(c.index, "adult_scene", c.adult_scene),
+      translation: c.translation == null ? null : val(c.index, "translation", c.translation),
+    }));
+  }
+  async function commit() {
+    await props.onSaveAll(buildMerged());
+    setEdits({});
+  }
+  async function withWork(key: string, fn: () => Promise<void>) {
+    setWorking(key);
+    try { await commit(); await fn(); } finally { setWorking(null); }
   }
   function rounds(idx: number) {
     return props.reports.filter((r) => r.chapter_index === idx);
@@ -495,23 +792,47 @@ function Chapters(props: {
   return (
     <>
       <h2 className="section">
-        Главы · Боты 04–08 · адалт в каждой
+        Главы · структура → диалоги+адалт → редактор
         <span className="row" style={{ marginLeft: "auto", gap: 8 }}>
-          <button className="small ghost" onClick={props.onRollbackWriting} title="Сбросить все написанные тексты и начать главы заново">↩ Перезапустить написание</button>
-          {dirty && <button className="small" onClick={() => { props.onSaveAll(draft); setDirty(false); }}>Сохранить главы</button>}
+          {props.canDownload && props.onDownload && (
+            <button className="small ghost" disabled={props.busy} onClick={() => props.onDownload!("txt")}
+              title="Скачать собранный текст всех глав">📥 Скачать</button>
+          )}
+          {props.rollbackStage === "dialogue" && (
+            <button className="small ghost" disabled={props.busy} onClick={props.onRollbackWriting}
+              title="Удалить все тексты глав и написать заново (план сохранится)">↩ Откат — написание</button>
+          )}
+          {props.rollbackStage === "structure" && (
+            <button className="small ghost" disabled={props.busy} onClick={props.onRollbackStructure}
+              title="Удалить план глав и сгенерировать структуру заново">↩ Откат — структура</button>
+          )}
+          {dirty && <button className="small" disabled={props.busy} onClick={commit}>Сохранить главы</button>}
         </span>
       </h2>
-      {[...draft].sort((a, b) => b.index - a.index).map((c) => {
+      {[...props.chapters].sort((a, b) => b.index - a.index).map((c) => {
         const i = c.index;
         const rs = rounds(c.index);
         const lastReport = rs[rs.length - 1];
         const allFindings = lastReport?.findings ?? [];
+        const crit = critOpen(c.index);
+        const openN = openAll(c.index);
+        const open = isOpen(c.index);
+        const verdict = !lastReport ? null : openN > 0 ? "needs" : "ok";
         return (
-          <div className={`card ${c.is_adult_point ? "adultcard" : ""}`} key={c.index}>
-            <div className="head">
-              <span className="t">Глава {c.index + 1} · {c.title}
-                {c.is_adult_point && <span className="adult">🔞 адалт</span>}</span>
-            </div>
+          <div className={`card chapter ${c.is_adult_point ? "adultcard" : ""} ${openN > 0 ? "needs" : ""}`} key={c.index}>
+            <button className="chap-head" onClick={() => toggle(c.index)}>
+              <span className="caret">{open ? "▾" : "▸"}</span>
+              <span className="t">Глава {c.index + 1} · {c.title}</span>
+              {c.is_adult_point && <span className="adult">🔞</span>}
+              {verdict === "needs" && (
+                <span className={`cbadge ${crit > 0 ? "crit" : "warn"}`}>
+                  {crit > 0 ? "🔴" : "🟡"} {openN} — решить
+                </span>
+              )}
+              {verdict === "ok" && <span className="cbadge ok">✓ готова</span>}
+              {c.dialogue == null && <span className="cbadge wait">черновик плана</span>}
+            </button>
+            {open && (<>
 
             {/* пре-чек адалта: главе не из чего генерить сцену */}
             {c.adult_block_reason && (
@@ -522,14 +843,14 @@ function Chapters(props: {
                   <div className="wh">Подсказка: {c.adult_bridge_hint}</div>
                 )}
                 <div className="row">
-                  <button className="small" disabled={adapting === c.index}
+                  <button className="small" disabled={adapting === c.index || props.busy}
                     onClick={async () => {
                       setAdapting(c.index);
                       try { await props.onAdaptAdult(c.index); } finally { setAdapting(null); }
                     }}>
                     {adapting === c.index ? "Адаптирую…" : "🔧 Адаптировать главу под адалт"}
                   </button>
-                  <button className="small ghost" disabled={adapting === c.index}
+                  <button className="small ghost" disabled={adapting === c.index || props.busy}
                     onClick={() => props.onSkipAdult(c.index)}>
                     Оставить без адалта
                   </button>
@@ -537,21 +858,37 @@ function Chapters(props: {
               </div>
             )}
 
-            {/* журнал редактора с принять/отклонить/коммент */}
+            {/* панель ревизии: чат по правкам (применение — кнопкой слева).
+                Сверху: свежая ревизия. Только если есть открытые замечания. */}
+            {lastReport && lastReport.findings.length > 0 && (
+              <RevisionPanel
+                threadId={props.threadId}
+                idx={c.index}
+                round={rs.length}
+                openCrit={crit}
+                busy={props.busy}
+              />
+            )}
+
+            {/* журнал редактора: ревизии ПО УБЫВАНИЮ — свежая сверху */}
             {rs.length > 0 && (
               <div className="journal">
-                {rs.map((r, k) => (
+                {rs.map((r, k) => ({ r, k })).reverse().map(({ r, k }) => (
                   <div className={`round ${critCount(r) > 0 ? "crit" : "clean"}`} key={k}>
                     <div className="rh">
-                      <span className="lbl">раунд {k + 1}</span>
+                      <span className="lbl">ревизия {k + 1}</span>
                       <span className="counts">
                         <span className="c-crit">🔴 {critCount(r)}</span>
                         <span className="c-imp">🟡 {impCount(r)}</span>
                         <span className="c-min">🟢 {minCount(r)}</span>
                       </span>
                     </div>
+                    {r.findings.length === 0 && (
+                      <div className="round-clean">✓ замечаний нет</div>
+                    )}
                     {r.findings.map((f) => (
                       <FindingRow key={f.id} f={f} active={activeFinding === f.id}
+                        disabled={props.busy}
                         onPick={() => pick(f.id)} onDecide={props.onDecide} />
                     ))}
                   </div>
@@ -560,22 +897,39 @@ function Chapters(props: {
             )}
 
             <label>План · Бот 04</label>
-            <textarea rows={3} value={c.plan} onChange={(e) => upd(i, { plan: e.target.value })} />
-            <ReviseBox label="Попросить ИИ изменить эту главу" onRevise={(fb) => props.onReviseChapter(i, fb)} />
+            <textarea rows={3} value={val(i, "plan", c.plan)} onChange={(e) => upd(i, "plan", e.target.value)} />
+            <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
+              {c.dialogue != null && (
+                <button className="small" disabled={working === `rw${i}` || props.busy}
+                  title="Сохранить план и переписать диалоги главы под него"
+                  onClick={() => withWork(`rw${i}`, () => props.onRewriteDialogue(i))}>
+                  {working === `rw${i}` ? "Переписываю…" : "↻ План → переписать диалоги"}
+                </button>
+              )}
+              <ReviseBox label="Попросить ИИ изменить план главы" disabled={props.busy} onRevise={(fb) => props.onReviseChapter(i, fb)} />
+            </div>
+            <ChatBox threadId={props.threadId} chapterIdx={i} title="Обсудить главу с ИИ"
+              disabled={props.busy} onApplied={props.onRefresh} />
 
             {c.dialogue != null && (<>
-              <label>Диалоги · Бот 05</label>
-              <Highlighted text={c.dialogue} findings={allFindings} active={activeFinding} onPick={pick} />
-              <textarea rows={9} value={c.dialogue} onChange={(e) => upd(i, { dialogue: e.target.value })} />
+              <label>Диалоги + адалт · Бот 05</label>
+              <Highlighted text={val(i, "dialogue", c.dialogue)} findings={allFindings} active={activeFinding} onPick={pick} />
+              <textarea rows={12} value={val(i, "dialogue", c.dialogue)} onChange={(e) => upd(i, "dialogue", e.target.value)} />
+              <button className="small ghost" disabled={working === `sp${i}` || props.busy}
+                title="Сохранить текст и подогнать план главы под написанное"
+                onClick={() => withWork(`sp${i}`, () => props.onSyncPlan(i))}>
+                {working === `sp${i}` ? "Синхронизирую…" : "↻ Диалоги → обновить план"}
+              </button>
             </>)}
             {c.adult_scene != null && (<>
               <label className="adult">Адалт-сцена · Бот 06</label>
-              <Highlighted text={c.adult_scene} findings={allFindings} active={activeFinding} onPick={pick} />
-              <textarea rows={10} value={c.adult_scene} onChange={(e) => upd(i, { adult_scene: e.target.value })} />
+              <Highlighted text={val(i, "adult_scene", c.adult_scene)} findings={allFindings} active={activeFinding} onPick={pick} />
+              <textarea rows={10} value={val(i, "adult_scene", c.adult_scene)} onChange={(e) => upd(i, "adult_scene", e.target.value)} />
             </>)}
             {c.translation != null && (<>
               <label>Перевод · Бот 08</label>
-              <textarea rows={7} value={c.translation} onChange={(e) => upd(i, { translation: e.target.value })} />
+              <textarea rows={7} value={val(i, "translation", c.translation)} onChange={(e) => upd(i, "translation", e.target.value)} />
+            </>)}
             </>)}
           </div>
         );
@@ -585,19 +939,23 @@ function Chapters(props: {
 }
 
 function FindingRow({
-  f, active, onPick, onDecide,
+  f, active, onPick, onDecide, disabled,
 }: {
-  f: Finding; active: boolean; onPick: () => void;
-  onDecide: (fid: string, body: { status?: FindingStatus; comment?: string; judge?: boolean }) => Promise<void>;
+  f: Finding; active: boolean; onPick: () => void; disabled?: boolean;
+  onDecide: (fid: string, body: { status?: FindingStatus }) => Promise<void>;
 }) {
-  const [comment, setComment] = useState(f.user_comment || "");
-  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  async function act(key: string, status: FindingStatus) {
+    setBusy(key);
+    try { await onDecide(f.id, { status }); } finally { setBusy(null); }
+  }
+  const rejected = f.status === "rejected";
   return (
     <div className={`finding ${f.severity} st-${f.status} ${active ? "active" : ""}`}>
       <div className="meta">
-        [{f.block}] → {f.responsible_node} · {f.locator}
+        [{f.block}] · {f.locator}
         <span className={`fstatus ${f.status}`}>
-          {f.status === "accepted" ? "принято" : f.status === "rejected" ? "отклонено" : "открыто"}
+          {rejected ? "✕ не менять" : "будет исправлено"}
         </span>
       </div>
       <div className="fprob">{f.problem}</div>
@@ -605,16 +963,212 @@ function FindingRow({
         <div className="fquote" onClick={onPick} title="Показать в тексте">“{f.quote}”</div>
       )}
       <div className="factions">
-        <button className="xs ok" onClick={() => onDecide(f.id, { status: "accepted" })}>✓ Принять</button>
-        <button className="xs no" onClick={() => onDecide(f.id, { status: "rejected" })}>✕ Отклонить</button>
-        <button className="xs" onClick={() => onDecide(f.id, { comment, judge: true })} title="ИИ сам решит по комментарию">🤖 ИИ решит</button>
-        <button className="xs ghost" onClick={() => setOpen((o) => !o)}>💬 Коммент</button>
+        {rejected ? (
+          <button className="xs ghost" disabled={!!busy || disabled}
+            onClick={() => act("open", "open")}>
+            {busy === "open" ? "…" : "↩ Вернуть в правки"}
+          </button>
+        ) : (
+          <button className="xs no" disabled={!!busy || disabled}
+            title="ИИ не будет это менять при перепроверке"
+            onClick={() => act("rej", "rejected")}>
+            {busy === "rej" ? "…" : "✕ Не менять это"}
+          </button>
+        )}
       </div>
-      {(open || f.user_comment) && (
-        <div className="fcomment">
-          <textarea rows={2} value={comment} placeholder="Комментарий к правке…"
-            onChange={(e) => setComment(e.target.value)} />
-          <button className="xs" onClick={() => onDecide(f.id, { comment })}>Сохранить коммент</button>
+    </div>
+  );
+}
+
+// ---------- панель ревизии: ТОЛЬКО чат по правкам ----------
+// У каждой ревизии свой чат (ключ с номером раунда). Применение — единой
+// кнопкой слева «Исправить всё и перепроверить» (она читает этот чат).
+function RevisionPanel({
+  threadId, idx, round, openCrit, busy,
+}: {
+  threadId: string; idx: number; round: number;
+  openCrit: number; busy?: boolean;
+}) {
+  const key = `chat:${threadId}:c${idx}:r${round}`;
+  return (
+    <div className="revpanel">
+      <div className="rp-head">
+        {openCrit > 0
+          ? `🔴 ${openCrit} критич. — исправь (слева «Исправить всё»), иначе дальше не пойдём`
+          : "Замечания не критичны. Обсуди при необходимости и жми «Исправить всё» слева"}
+      </div>
+      <ChatBox threadId={threadId} chapterIdx={idx} storageKey={key}
+        disabled={busy} title={`Обсудить правки ревизии ${round}`} />
+    </div>
+  );
+}
+
+// ---------- чат с ИИ-редактором: память (localStorage) + применить к главе ----------
+function ChatBox({
+  threadId, chapterIdx, findingId, title, onApplied, storageKey, disabled,
+}: {
+  threadId: string; chapterIdx?: number; findingId?: string; title: string;
+  onApplied?: () => void; storageKey?: string; disabled?: boolean;
+}) {
+  // storageKey задан → чат привязан к конкретной ревизии (своя память),
+  // применение делает RevisionPanel, поэтому кнопку «применить к главе» прячем.
+  const key = storageKey
+    ?? `chat:${threadId}:${chapterIdx != null ? `c${chapterIdx}` : `f${findingId}`}`;
+  const isRevisionChat = !!storageKey;
+  const [open, setOpen] = useState(false);
+  const [msgs, setMsgs] = useState<ChatMsg[]>([]);
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [applyMsg, setApplyMsg] = useState<string | null>(null);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+
+  // память: грузим/сохраняем историю чата в localStorage (переживает рефреш)
+  useEffect(() => {
+    try { const v = localStorage.getItem(key); if (v) setMsgs(JSON.parse(v)); } catch {}
+  }, [key]);
+  useEffect(() => {
+    try { localStorage.setItem(key, JSON.stringify(msgs)); } catch {}
+  }, [key, msgs]);
+  useEffect(() => {
+    if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight;
+  }, [msgs.length, busy]);
+
+  async function send() {
+    const t = text.trim();
+    if (!t || busy) return;
+    const next: ChatMsg[] = [...msgs, { role: "user", content: t }];
+    setMsgs(next); setText(""); setBusy(true);
+    try {
+      const { reply } = await chatWithEditor(threadId, next, {
+        chapter_idx: chapterIdx, finding_id: findingId,
+      });
+      setMsgs([...next, { role: "assistant", content: reply }]);
+    } catch {
+      setMsgs([...next, { role: "assistant", content: "⚠ Ошибка запроса — попробуй ещё раз." }]);
+    } finally { setBusy(false); }
+  }
+
+  async function applyToChapter() {
+    if (chapterIdx == null || busy || msgs.length === 0) return;
+    setBusy(true); setApplyMsg(null);
+    try {
+      const r = await applyChatToChapter(threadId, chapterIdx, msgs);
+      setApplyMsg(r.changed ? `✓ Глава изменена: ${r.note}` : `• Без изменений: ${r.note}`);
+      if (r.changed) onApplied?.();
+    } catch {
+      setApplyMsg("⚠ Не удалось применить");
+    } finally { setBusy(false); }
+  }
+
+  if (!open) {
+    return (
+      <button className="small ghost" onClick={() => setOpen(true)}>
+        💬 {title}{msgs.length > 0 ? ` (${msgs.length})` : ""}
+      </button>
+    );
+  }
+  return (
+    <div className="chatbox">
+      <div className="ch-head">
+        <span>💬 {title}</span>
+        <span className="row" style={{ gap: 6 }}>
+          {msgs.length > 0 && <button className="xs ghost" onClick={() => { setMsgs([]); setApplyMsg(null); }}>очистить</button>}
+          <button className="xs ghost" onClick={() => setOpen(false)}>свернуть</button>
+        </span>
+      </div>
+      <div className="ch-msgs" ref={boxRef}>
+        {msgs.length === 0 && (
+          <div className="ch-hint">Обсуди правку: «как лучше переписать сцену?», «согласен с замечанием?», «предложи 2 варианта реплики». Потом можно применить обсуждённое к главе.</div>
+        )}
+        {msgs.map((m, i) => (
+          <div key={i} className={`ch-msg ${m.role}`}>{m.content}</div>
+        ))}
+        {busy && <div className="ch-msg assistant typing">ИИ печатает…</div>}
+      </div>
+      {applyMsg && <div className="ch-apply-note">{applyMsg}</div>}
+      <div className="ch-input">
+        <textarea rows={2} value={text} placeholder="Сообщение…"
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
+        <button className="small" disabled={busy || !text.trim() || disabled} onClick={send}>
+          {busy ? "…" : "➤"}
+        </button>
+      </div>
+      {!isRevisionChat && chapterIdx != null && msgs.length > 0 && (
+        <button className="small" style={{ margin: "0 12px 12px" }}
+          disabled={busy || disabled} onClick={applyToChapter}
+          title="ИИ внесёт согласованное в главу (или оставит как есть)">
+          {busy ? "Применяю…" : "✦ Применить обсуждённое к главе"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ---------- Claude по подписке: статус + тумблер «все боты» + авторизация ----------
+function ClaudeSubPanel() {
+  const [s, setS] = useState<ClaudeStatus | null>(null);
+  const [model, setModel] = useState("sonnet");
+  const [showAuth, setShowAuth] = useState(false);
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    try { const r = await claudeStatus(); setS(r); setModel(r.model || "sonnet"); } catch {}
+  }
+  useEffect(() => { load(); }, []);
+
+  async function toggle(enabled: boolean) {
+    setBusy(true);
+    try { setS(await setClaudeSubscription(enabled, model)); } finally { setBusy(false); }
+  }
+  async function saveToken() {
+    if (!token.trim()) return;
+    setBusy(true);
+    try { setS(await setClaudeToken(token.trim())); setToken(""); setShowAuth(false); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="subpanel">
+      <div className="sp-head">
+        <span>⟡ Claude по подписке</span>
+        <span className={`sp-dot ${s?.authorized ? "ok" : "no"}`} title={s?.authorized ? "подключено" : "нет авторизации"} />
+      </div>
+      <div className="sp-status">
+        {s?.authorized
+          ? <>подключено{s.expires ? ` · до ${s.expires}` : ""}{s.sub ? ` · ${s.sub}` : ""}</>
+          : "не авторизован"}
+      </div>
+      {s?.warn && <div className="sp-warn">⚠ {s.warn}</div>}
+
+      <div className="check" style={{ margin: "8px 0" }}>
+        <input id="suball" type="checkbox" disabled={!s?.authorized || busy}
+          checked={!!s?.enabled} onChange={(e) => toggle(e.target.checked)} />
+        <label htmlFor="suball" className="inline">Все боты через подписку (кроме адалта)</label>
+      </div>
+      <select className="model-select" value={model}
+        onChange={(e) => { setModel(e.target.value); if (s?.enabled) setClaudeSubscription(true, e.target.value).then(setS); }}>
+        <option value="haiku">Haiku — быстро/дёшево по лимиту</option>
+        <option value="sonnet">Sonnet — баланс</option>
+        <option value="opus">Opus — максимум</option>
+      </select>
+
+      <button className="small ghost" style={{ marginTop: 8 }} onClick={() => setShowAuth((v) => !v)}>
+        {s?.authorized ? "Обновить авторизацию" : "Подключить подписку"}
+      </button>
+      {showAuth && (
+        <div className="sp-auth">
+          <div className="sp-step">1. В терминале выполни:</div>
+          <code className="sp-code">claude setup-token</code>
+          <div className="sp-step">2. Откроется браузер → авторизуйся в Claude → скопируй выданный токен.</div>
+          <div className="sp-step">3. Вставь токен сюда:</div>
+          <textarea rows={2} value={token} placeholder="sk-ant-oat… (токен из setup-token)"
+            onChange={(e) => setToken(e.target.value)} />
+          <button className="small" disabled={busy || !token.trim()} onClick={saveToken}>
+            {busy ? "…" : "Подключить токен"}
+          </button>
+          <div className="sp-note">Если ты уже залогинен в Claude Code — токен не нужен, подписка уже работает.</div>
         </div>
       )}
     </div>

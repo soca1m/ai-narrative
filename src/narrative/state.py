@@ -26,25 +26,54 @@ Severity = Literal["critical", "important", "minor"]  # 🔴 / 🟡 / 🟢
 FindingStatus = Literal["open", "accepted", "rejected"]
 
 
+class StaticShot(BaseModel):
+    """Один статик/анимация для художника (машиночитаемо, без regex-парсинга)."""
+    tag: str = Field(description="Код кадра: {NN}-{Локация}-{N} или {NN}-{Локация}Anim-{N}, "
+                     "например 07-HeroRoom-0 или 07-HeroRoomAnim-2")
+    description: str = Field(description="Описание кадра/движения для художника")
+
+
 class Chapter(BaseModel):
     """Одна глава из поглавного плана (Бот 4)."""
     index: int
     title: str
     plan: str                       # текст плана главы от Бота 4
-    is_adult_point: bool = True     # адалт теперь в КАЖДОЙ главе
+    is_adult_point: bool = False    # Бот 4 решает, где адалт органичен
+    adult_note: str = ""            # кто с кем и почему сцена уместна здесь
     dialogue: Optional[str] = None  # текст главы от Бота 5
     adult_scene: Optional[str] = None  # адалт-вставка от Бота 6
     translation: Optional[str] = None  # перевод от Бота 8
+    # Статики/анимации для художника (из structured-вывода Ботов 5/6).
+    statics: list[StaticShot] = Field(default_factory=list)
+    anims: list[StaticShot] = Field(default_factory=list)
+    adult_statics: list[StaticShot] = Field(default_factory=list)
+    adult_anims: list[StaticShot] = Field(default_factory=list)
     # Пре-чек адалта: глава без почвы для сцены → причина + подсказка адаптации.
     adult_block_reason: Optional[str] = None
     adult_bridge_hint: Optional[str] = None
+
+
+class DialogueOut(BaseModel):
+    """Строгий контракт Бота 5: текст главы + статики отдельными полями."""
+    script: str = Field(description="Полный текст главы в формате визуальной новеллы. "
+                        "Теги статиков/анимаций стоят в потоке текста на своих местах "
+                        "(отдельной строкой перед репликами кадра).")
+    statics: list[StaticShot] = Field(default_factory=list,
+                                      description="Все статики главы по порядку")
+    anims: list[StaticShot] = Field(default_factory=list,
+                                    description="Все анимации главы по порядку")
 
 
 class AdultSceneOut(BaseModel):
     """Строгий контракт ответа Бота 6: отказ — это поле, а не текст для парсинга."""
     refused: bool = Field(description="True — модель не может написать сцену")
     reason: str = Field(default="", description="Причина отказа (если refused)")
-    scene: str = Field(default="", description="Полный текст адалт-сцены (если не refused)")
+    scene: str = Field(default="", description="Полный текст адалт-сцены (если не refused), "
+                       "теги статиков/анимаций в потоке текста на своих местах")
+    statics: list[StaticShot] = Field(default_factory=list,
+                                      description="Все статики сцены по порядку")
+    anims: list[StaticShot] = Field(default_factory=list,
+                                    description="Все анимации сцены по порядку")
 
 
 class AdultFeasibility(BaseModel):
@@ -65,6 +94,18 @@ class ChapterPlan(BaseModel):
     plan: str = Field(
         description="Полный план главы одним блоком: локация, что происходит, "
         "эмоциональная дуга, точка выбора, финал."
+    )
+    is_adult: bool = Field(
+        default=True,
+        description="ПОЧТИ ВСЕГДА true — это adult-новелла, откровенная сцена "
+        "нужна почти в КАЖДОЙ главе. Если прямого повода нет — заложи его в plan "
+        "(влечение, провокация, уединение пары) и ставь true. false — РЕДКОЕ "
+        "исключение: только чистый пролог/эпилог, где интим сломал бы момент.",
+    )
+    adult_note: str = Field(
+        default="",
+        description="Кто с кем в откровенной сцене этой главы и через какой "
+        "повод она входит (для художника и Бота 6).",
     )
 
 
@@ -111,6 +152,35 @@ class Finding(FindingOut):
     id: str = ""                       # стабилен по (глава, block, locator)
     status: FindingStatus = "open"     # решение нарративщика
     user_comment: str = ""             # комментарий нарративщика к замечанию
+    judge_reason: str = ""             # вердикт ИИ при «ИИ решит» (для UI)
+
+
+class ChapterCountOut(BaseModel):
+    """Предложение Бота по оптимальному числу глав (юзер апрувит/меняет)."""
+    count: int = Field(description="Рекомендованное число глав для этой истории")
+    reason: str = Field(description="Почему столько — 1-2 предложения")
+
+
+class StructureFixOut(BaseModel):
+    """Возврат редактора структуры (#2): исправленный план + список фиксов."""
+    chapters: list[ChapterPlan] = Field(default_factory=list)
+    fixes: list[str] = Field(default_factory=list,
+                             description="Что починил, по пункту на фикс")
+
+
+class ChatApplyOut(BaseModel):
+    """Итог обсуждения с ИИ → применить к главе (или не трогать)."""
+    changed: bool = Field(description="True — внесены правки; False — главу не трогаем")
+    note: str = Field(default="", description="Что изменено / почему не тронуто (1-2 строки)")
+    script: str = Field(default="", description="Полный новый текст главы (если changed)")
+
+
+class JudgeOut(BaseModel):
+    """Вердикт ИИ для «ИИ решит» — strict JSON, надёжнее парсинга одного слова."""
+    decision: Literal["accept", "reject"] = Field(
+        description="accept — замечание справедливо, исправлять; "
+        "reject — можно оставить как есть")
+    reason: str = Field(description="Кратко почему (1-2 предложения), для нарративщика")
 
 
 class EditorReport(BaseModel):
@@ -134,7 +204,10 @@ class State(TypedDict, total=False):
     genre: str            # особый жанр → может менять инструкции ботов
     target_language: str  # язык перевода (Бот 8)
     translation_enabled: bool   # Бот 8 вкл/выкл (перевод временно на паузе)
-    chapters_per_batch: int     # сколько глав Бот 4 пишет за одну порцию
+    chapters_per_batch: int     # (устар.) запас; число глав теперь target_chapters
+    suggested_chapters: int     # ИИ предложил оптимальное число глав
+    count_reason: str           # обоснование предложения
+    target_chapters: int        # утверждённое нарративщиком число глав
 
     # --- Бот 1: логлайны + выбор ---
     loglines: list[str]         # распарсенный список вариантов логлайна
@@ -151,9 +224,21 @@ class State(TypedDict, total=False):
     structure_done: bool        # вся структура сгенерирована
     structure_action: Optional[str]  # "more" | "proceed" (команда нарративщика)
 
+    # --- фаза поглавной работы: сначала весь КОНТЕНТ, потом РЕДАКТОР ---
+    # "content" — Бот 5 пишет все главы (диалоги+адалт) по очереди;
+    # "edit" — только после всего контента Бот 7 проверяет каждую главу.
+    phase: Optional[str]
+
     editor_reports: Annotated[list[EditorReport], operator.add]
     # решения нарративщика по findings: id -> {"status":..., "comment":...}
     finding_decisions: dict[str, dict]
+    # тексты ОТКЛОНЁННЫХ нарративщиком претензий — редактор их больше не поднимает
+    # (переживает смену fid между проходами, в отличие от finding_decisions)
+    rejected_notes: list[str]
+    # выбранная нарративщиком модель для глав (Бот 5, не-адалт) — слаг OpenRouter
+    chapter_model: Optional[str]
+    # что починил редактор структуры (#2) — для показа в UI
+    structure_fixes: list[str]
 
     # --- управление циклом правок (editor ↔ bot) ---
     revision_target: Optional[NodeName]  # кого переделывать

@@ -14,6 +14,7 @@ export type Finding = {
   problem: string;
   status: FindingStatus;
   user_comment: string;
+  judge_reason: string;
 };
 
 export type EditorReport = {
@@ -40,6 +41,7 @@ export type NarrativeState = {
   target_language?: string;
   translation_enabled?: boolean;
   chapters_per_batch?: number;
+  chapter_model?: string | null;
   loglines?: string[];
   selected_logline?: string;
   logline?: string;
@@ -47,7 +49,12 @@ export type NarrativeState = {
   characters?: string;
   chapters?: Chapter[];
   chapter_idx?: number;
+  phase?: string;
+  suggested_chapters?: number;
+  count_reason?: string;
+  target_chapters?: number;
   structure_done?: boolean;
+  structure_fixes?: string[];
   editor_reports?: EditorReport[];
   finding_decisions?: Record<string, { status?: string; comment?: string; judged?: boolean }>;
   retry_count?: Record<string, number>;
@@ -58,9 +65,9 @@ export type StartReq = {
   theme: string;
   genre?: string;
   target_language: string;
-  chapters_per_batch: number;
   translation_enabled: boolean;
   step_mode: boolean;
+  chapter_model?: string;
 };
 
 async function jpost<T = any>(url: string, body?: unknown): Promise<T> {
@@ -79,7 +86,7 @@ export async function startRun(req: StartReq): Promise<{ thread_id: string }> {
 
 export async function getState(
   threadId: string,
-): Promise<{ status: string; next: string[]; state: NarrativeState }> {
+): Promise<{ status: string; next: string[]; error?: string; state: NarrativeState }> {
   const r = await fetch(`${API_BASE}/api/runs/${threadId}/state`);
   if (!r.ok) throw new Error(`state failed: ${r.status}`);
   return r.json();
@@ -108,8 +115,16 @@ export const reviseStage = (id: string, stage: string, feedback: string, chapter
 export const reviseChapter = (id: string, idx: number, feedback: string) =>
   jpost(`/api/runs/${id}/chapter/${idx}/revise`, { feedback });
 
-export const structureMore = (id: string) => jpost(`/api/runs/${id}/structure/more`);
-export const structureProceed = (id: string) => jpost(`/api/runs/${id}/structure/proceed`);
+// план → переписать диалоги главы; диалоги → подогнать план
+export const rewriteDialogue = (id: string, idx: number) =>
+  jpost(`/api/runs/${id}/chapter/${idx}/rewrite_dialogue`);
+export const syncPlan = (id: string, idx: number) =>
+  jpost(`/api/runs/${id}/chapter/${idx}/sync_plan`);
+
+export const setChapterCount = (id: string, count: number) =>
+  jpost(`/api/runs/${id}/chapter_count`, { count });
+export const setStepMode = (id: string, enabled: boolean) =>
+  jpost(`/api/runs/${id}/step`, { enabled });
 
 export const decideFinding = (
   id: string,
@@ -119,6 +134,47 @@ export const decideFinding = (
 
 export const rollback = (id: string, stage: string) =>
   jpost(`/api/runs/${id}/rollback`, { stage });
+
+export type ClaudeStatus = {
+  authorized: boolean; via: string | null; enabled: boolean; model: string;
+  expires?: string | null; sub?: string | null; warn?: string;
+};
+export const claudeStatus = (): Promise<ClaudeStatus> =>
+  fetch(`${API_BASE}/api/claude/status`).then((r) => r.json());
+export const setClaudeSubscription = (enabled: boolean, model?: string): Promise<ClaudeStatus> =>
+  jpost("/api/claude/subscription", { enabled, model });
+export const setClaudeToken = (token: string): Promise<ClaudeStatus> =>
+  jpost("/api/claude/token", { token });
+
+export type ChatMsg = { role: "user" | "assistant"; content: string };
+export const chatWithEditor = (
+  id: string,
+  messages: ChatMsg[],
+  ctx: { chapter_idx?: number; finding_id?: string },
+): Promise<{ reply: string }> =>
+  jpost(`/api/runs/${id}/chat`, { messages, ...ctx });
+
+// применить обсуждённое в чате к главе целиком (ИИ решает: править/не трогать)
+export const applyChatToChapter = (
+  id: string, idx: number, messages: ChatMsg[],
+): Promise<{ changed: boolean; note: string }> =>
+  jpost(`/api/runs/${id}/chapter/${idx}/apply_chat`, { messages, chapter_idx: idx });
+
+// один шаг цикла правок: запускает правку+перепроверку В ФОНЕ (LLM долгий),
+// сразу отвечает; фронт поллит status до paused.
+export const applyRevision = (
+  id: string, idx: number, messages: ChatMsg[] = [],
+): Promise<{ ok: boolean; started: boolean }> =>
+  jpost(`/api/runs/${id}/chapter/${idx}/apply_revision`, { messages });
+
+// собрать готовый проект для скачивания
+export const exportProject = (
+  id: string, fmt: "txt" | "md" = "txt",
+): Promise<{ filename: string; text: string; chapters: number }> =>
+  fetch(`${API_BASE}/api/runs/${id}/export?fmt=${fmt}`).then((r) => {
+    if (!r.ok) throw new Error(`export failed: ${r.status}`);
+    return r.json();
+  });
 
 export const adaptAdult = (id: string, idx: number) =>
   jpost(`/api/runs/${id}/chapter/${idx}/adapt_adult`);

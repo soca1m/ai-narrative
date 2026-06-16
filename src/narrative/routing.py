@@ -10,10 +10,10 @@ from __future__ import annotations
 from .config import MAX_REVISIONS
 from .state import EditorReport, Finding, NodeName
 
-# Узлы, на которые МОЖНО маршрутизировать правку в поглавном цикле.
+# Единственная цель правки в поглавном цикле — dialogue (он пишет и адалт).
 # characters/structure СПЕЦИАЛЬНО исключены: их регенерация пересобирает все
 # главы и сбрасывает прогресс → каскад и риск бесконечного цикла.
-_PER_CHAPTER: set[NodeName] = {"dialogue", "adult"}
+_PER_CHAPTER: set[NodeName] = {"dialogue"}
 
 
 def apply_decisions(report: EditorReport, decisions: dict[str, dict]) -> EditorReport:
@@ -31,15 +31,15 @@ def apply_decisions(report: EditorReport, decisions: dict[str, dict]) -> EditorR
             f = f.model_copy(update={
                 "status": d.get("status", f.status),
                 "user_comment": d.get("comment", f.user_comment),
+                "judge_reason": d.get("judge_reason", f.judge_reason),
             })
         findings.append(f)
     return report.model_copy(update={"findings": findings})
 
 
-def _clamp(target: NodeName | None, is_adult: bool) -> NodeName:
-    if target in _PER_CHAPTER:
-        return target
-    return "adult" if is_adult else "dialogue"
+def _clamp(target: NodeName | None) -> NodeName:
+    # characters/structure/adult → всё чинится перезаписью главы в dialogue.
+    return target if target in _PER_CHAPTER else "dialogue"
 
 
 def _active_critical(report: EditorReport) -> list[Finding]:
@@ -62,13 +62,7 @@ def pick_revision_target(report: EditorReport,
     if not blocking:
         return None, ""
 
-    top = blocking[0]
-    if is_adult:
-        adult_first = [f for f in blocking if f.responsible_node == "adult"]
-        if adult_first:
-            top = adult_first[0]
-
-    target = _clamp(top.responsible_node, is_adult)
+    target = _clamp(blocking[0].responsible_node)
 
     lines = []
     for f in blocking:

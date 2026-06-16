@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import hashlib
-import re
+import os
 from functools import lru_cache
 
 from . import prompts
@@ -17,29 +17,61 @@ from .state import (
     AdultFeasibility,
     AdultSceneOut,
     Chapter,
+    ChapterCountOut,
+    DialogueOut,
     EditorReport,
     EditorReportOut,
     Finding,
     State,
+    StructureFixOut,
     StructurePlan,
 )
 from .util import parse_chapters, parse_loglines
 
 
-# Ленивая инициализация: клиенты создаются при первом вызове, ПОСЛЕ load_dotenv.
-@lru_cache(maxsize=1)
-def _structural() -> LLM:
-    return LLM(structural_provider())
+def _subscription_on() -> bool:
+    """Глобальный тумблер: все НЕ-адалт боты через подписку Claude (Agent SDK)."""
+    return os.environ.get("USE_CLAUDE_SUBSCRIPTION") == "1"
 
 
+def _sub_model() -> str:
+    return os.environ.get("CLAUDE_SUB_MODEL", "sonnet")
+
+
+def _sub_llm():
+    from .claude_sub import ClaudeSubLLM  # noqa: PLC0415 — ленивый импорт SDK
+    return ClaudeSubLLM(_sub_model())
+
+
+# НЕ кэшируем структурный/редактор — чтобы тумблер подписки применялся сразу.
+def _structural():
+    return _sub_llm() if _subscription_on() else LLM(structural_provider())
+
+
+def _editor():
+    return _sub_llm() if _subscription_on() else LLM(editor_provider())
+
+
+# Адалт ВСЕГДА через uncensored-модель (подписка Claude цензурит) — кэшируем.
 @lru_cache(maxsize=1)
 def _adult() -> LLM:
     return LLM(adult_provider())
 
 
-@lru_cache(maxsize=1)
-def _editor() -> LLM:
-    return LLM(editor_provider())
+@lru_cache(maxsize=8)
+def _llm_for(model: str | None):
+    """LLM с выбранной моделью для глав (#3). None → дефолтная structural.
+
+    Префикс `claude-sub:` → Claude через ПОДПИСКУ Pro/Max (#4, Agent SDK,
+    без платы за токены): claude-sub:sonnet / claude-sub:opus / claude-sub:haiku.
+    """
+    if not model:
+        return _structural()
+    if model.startswith("claude-sub:"):
+        from .claude_sub import ClaudeSubLLM  # noqa: PLC0415
+        return ClaudeSubLLM(model.split(":", 1)[1] or "sonnet")
+    from dataclasses import replace  # noqa: PLC0415
+    return LLM(replace(structural_provider(), model=model))
 
 
 _MAX_CHAPTERS = 20  # хард-кап общего числа глав (страховка авто-петли структуры)
@@ -130,96 +162,370 @@ def _gen_chapter_batch(state: State, start: int, n: int) -> tuple[list[Chapter],
             system + suffix + prompts.STRUCTURE_JSON_SUFFIX, ctx,
             StructurePlan, temperature=0.7,
         )
-        full = [(c.title, c.plan) for c in plan.chapters]
+        # (title, plan, is_adult, adult_note) — адалт-точка из решения Бота 4.
+        full = [(c.title, c.plan, c.is_adult, c.adult_note) for c in plan.chapters]
         story_complete = bool(plan.story_complete)
         if not full:
             raise ValueError("пустая порция")
-    except Exception:  # фолбэк: проза + regex-разбор по «ГЛАВА N»
+    except Exception:  # фолбэк: проза + regex-разбор по «ГЛАВА N» (адалт гейтит пре-чек)
         out = _structural().complete(system + suffix, ctx)
-        full = [(c.title, c.plan) for c in parse_chapters(out)]
+        full = [(c.title, c.plan, True, "") for c in parse_chapters(out)]
         story_complete = False
 
     # ЖЁСТКО держим размер порции: модель часто игнорит «ровно N» и выдаёт всё.
     overflow = len(full) > n
     full = full[:n]
-    new = [
-        Chapter(index=start + i, title=t, plan=p, is_adult_point=True)
-        for i, (t, p) in enumerate(full)
-    ]
+    new = []
+    for i, (title, plan_text, is_adult, note) in enumerate(full):
+        if is_adult and note:  # подсказку «кто с кем» кладём в план — её увидит Бот 6
+            plan_text = f"{plan_text}\n\n[Адалт-точка: {note}]"
+        new.append(Chapter(
+            index=start + i, title=title, plan=plan_text,
+            is_adult_point=is_adult, adult_note=note or "",
+        ))
     # done только если НЕ обрезали и (модель сказала «конец» ИЛИ дала меньше N).
     done = (not overflow) and (story_complete or len(new) < n)
     return new, done
 
 
+# Рекомендуемое число глав по умолчанию (когда ИИ-оценка недоступна).
+_DEFAULT_CHAPTERS = 6
+
+
+def chapter_count_node(state: State) -> dict:
+    """Перед структурой: ИИ предлагает оптимальное число глав. Пауза (step) →
+    нарративщик апрувит или задаёт своё (target_chapters), потом structure."""
+    if state.get("target_chapters"):  # юзер уже утвердил → ничего не делаем
+        return {}
+    user = (
+        f"Синопсис:\n{state.get('synopsis', '')}\n\n"
+        f"Карточки:\n{state.get('characters', '')}\n\n"
+        "Сколько глав оптимально для этой adult-новеллы? Компактная, плотная "
+        "история без воды. По умолчанию ориентир — 6 глав; больше предлагай "
+        "только если сюжет реально не умещается. Адалт должен идти рано и часто."
+    )
+    try:
+        out = _structural().structured(
+            "Ты — продюсер визуальных новелл. Оцени оптимальный объём. "
+            "Не раздувай: предпочитай компактные истории (~6 глав).",
+            user, ChapterCountOut, temperature=0.3)
+        n = max(2, min(out.count, _MAX_CHAPTERS))
+        reason = out.reason
+    except Exception:
+        n = _DEFAULT_CHAPTERS
+        reason = f"не удалось оценить — рекомендуемый объём {n} глав"
+    return {
+        "suggested_chapters": n,
+        "count_reason": reason,
+        "log": [f"✓ Объём: ИИ предлагает {n} глав — {reason}"],
+    }
+
+
+# Маркеры главы-заглушки/отказа (модель вместо плана пишет «главу не нужно
+# писать, история завершена»). Такую главу отбрасываем — это и был баг.
+_FILLER_MARKERS = (
+    "не генерируется", "не нужна", "не требуется", "story_complete",
+    "историю завершил", "история завершена", "история уже завершена",
+    "продолжение нарушило", "глава отсутствует", "пустая глава",
+    "no chapter", "story is complete", "not generated",
+)
+
+
+def _is_filler_chapter(title: str, plan: str) -> bool:
+    """True — глава-заглушка/отказ, а не реальный план (фильтр мусора структуры)."""
+    head = f"{title}\n{plan}".lower()
+    if any(m in head for m in _FILLER_MARKERS):
+        return True
+    # аномально длинный «заголовок» = модель впихнула объяснение в title
+    if len(title) > 120:
+        return True
+    return False
+
+
 def structure_node(state: State) -> dict:
-    """Бот 4 — пишет структуру ПОРЦИЯМИ по chapters_per_batch глав за раз.
+    """Бот 4 — пишет структуру РОВНО на утверждённое число глав (target_chapters).
 
-    Команда нарративщика (structure_action):
-      "proceed" — хватит структуры, переходим к написанию глав;
-      иначе — генерим следующую порцию.
-    Адалт-точка ставится на КАЖДУЮ главу.
+    Генерим всю дугу ОДНИМ заходом (STRUCTURE_FULL_SUFFIX) — модель сама
+    распределяет сюжет на N глав, не оставляя глав-заглушек. Заглушки/отказы
+    отфильтровываем, недобор добираем порциями, перебор обрезаем.
     """
-    action = state.get("structure_action")
-    existing = list(state.get("chapters") or [])
+    target = int(state.get("target_chapters")
+                 or state.get("suggested_chapters") or _DEFAULT_CHAPTERS)
+    target = max(2, min(target, _MAX_CHAPTERS))
 
-    # Нарративщик сказал «достаточно» → завершаем структуру без новой порции.
-    if action == "proceed" and existing:
-        return {
-            "structure_done": True,
-            "structure_action": None,
-            "chapter_idx": 0,
-            "log": [f"✓ Бот 4: структура завершена нарративщиком ({len(existing)} глав)"],
-        }
+    chapters: list[Chapter] = _gen_full_structure(state, target)
+    chapters = [c for c in chapters
+                if not _is_filler_chapter(c.title, c.plan)]
 
-    n = int(state.get("chapters_per_batch") or 3)
-    start = len(existing)
-    new, done = _gen_chapter_batch(state, start, n)
-    chapters = existing + new
-    if len(chapters) >= _MAX_CHAPTERS:  # хард-кап от бесконечной петли в авто-режиме
-        done = True
+    # недобор после фильтра → добираем порциями (контекст = уже готовые главы)
+    guard = 0
+    while len(chapters) < target and guard < 4:
+        st2 = dict(state)
+        st2["chapters"] = chapters
+        st2["revision_feedback"] = None
+        need = target - len(chapters)
+        new, _ = _gen_chapter_batch(st2, len(chapters), need)
+        new = [c for c in new if not _is_filler_chapter(c.title, c.plan)]
+        if not new:
+            break
+        chapters.extend(new)
+        guard += 1
+
+    chapters = chapters[:target]             # ровно target
+    for i, ch in enumerate(chapters):        # переиндексация после фильтра/добора
+        ch.index = i
 
     return {
         "chapters": chapters,
         "chapter_idx": 0,
+        "phase": "content",
         "retry_count": state.get("retry_count") or {},
-        "structure_done": done,
-        "structure_action": None,
+        "structure_done": True,
         "revision_feedback": None,
         "revision_target": None,
-        "log": [
-            f"✓ Бот 4: порция глав {start + 1}–{start + len(new)} готова "
-            f"(всего {len(chapters)}{', история завершена' if done else ''})"
-        ],
+        "log": [f"✓ Бот 4: структура готова — {len(chapters)}/{target} глав"],
     }
+
+
+def _gen_full_structure(state: State, target: int) -> list[Chapter]:
+    """Вся структура за один structured-запрос на точное число глав."""
+    ctx = (f"Синопсис:\n{state['synopsis']}\n\n"
+           f"Карточки:\n{state['characters']}")
+    system = _sys(state, prompts.STRUCTURE, names=True)
+    suffix = prompts.STRUCTURE_FULL_SUFFIX.format(n=target)
+    try:
+        plan = _structural().structured(
+            system + suffix + prompts.STRUCTURE_JSON_SUFFIX, ctx,
+            StructurePlan, temperature=0.7,
+        )
+        full = [(c.title, c.plan, c.is_adult, c.adult_note)
+                for c in plan.chapters]
+        if not full:
+            raise ValueError("пустая структура")
+    except Exception:  # фолбэк: проза + regex-разбор «ГЛАВА N»
+        out = _structural().complete(system + suffix, ctx)
+        full = [(c.title, c.plan, True, "") for c in parse_chapters(out)]
+
+    chapters: list[Chapter] = []
+    for i, (title, plan_text, is_adult, note) in enumerate(full):
+        if is_adult and note:
+            plan_text = f"{plan_text}\n\n[Адалт-точка: {note}]"
+        chapters.append(Chapter(
+            index=i, title=title, plan=plan_text,
+            is_adult_point=is_adult, adult_note=note or "",
+        ))
+    return chapters
+
+
+def structure_editor_node(state: State) -> dict:
+    """Редактор СТРУКТУРЫ (#2): после завершения плана, ДО написания текстов.
+
+    Проверяет связность/арки/канон/адалт-распределение/точки выбора и САМ
+    чинит план — чтобы финальный редактор не тонул в критических ошибках.
+    """
+    chapters = list(state.get("chapters") or [])
+    if not chapters:
+        return {"log": ["· Редактор структуры: глав нет, пропуск"]}
+
+    plan_text = "\n\n".join(
+        f"Глава {c.index + 1}: {c.title}\n"
+        f"[адалт: {'да' if c.is_adult_point else 'нет'}"
+        f"{' — ' + c.adult_note if c.adult_note else ''}]\n{c.plan}"
+        for c in chapters
+    )
+    user = (
+        f"Синопсис:\n{state.get('synopsis', '')}\n\n"
+        f"Карточки персонажей:\n{state.get('characters', '')}\n\n"
+        f"Поглавный план ({len(chapters)} глав):\n{plan_text}"
+    )
+    try:
+        out = _structural().structured(
+            _sys(state, prompts.STRUCTURE_EDITOR, names=True)
+            + prompts.STRUCTURE_EDITOR_JSON,
+            user, StructureFixOut, temperature=0.4,
+        )
+        # количество глав должно сохраниться — иначе не доверяем фиксу
+        if len(out.chapters) != len(chapters):
+            raise ValueError(
+                f"редактор вернул {len(out.chapters)} глав вместо {len(chapters)}")
+    except Exception as exc:
+        return {"log": [f"⚠ Редактор структуры: пропуск ({str(exc)[:80]})"]}
+
+    fixed = [
+        Chapter(index=i, title=c.title, plan=c.plan,
+                is_adult_point=bool(c.is_adult), adult_note=c.adult_note or "")
+        for i, c in enumerate(out.chapters)
+    ]
+    n = len(out.fixes)
+    log = [f"✓ Редактор структуры: план проверен — "
+           f"{'исправлений нет' if n == 0 else f'{n} исправлений'}"]
+    log += [f"  · {fix}" for fix in out.fixes[:8]]
+    return {"chapters": fixed, "structure_fixes": out.fixes, "log": log}
 
 
 # ---------- Боты 5-6-7: поглавный цикл ----------
 
-def dialogue_node(state: State) -> dict:
-    idx = state["chapter_idx"]
-    chapters = list(state["chapters"])
-    ch = chapters[idx]
+def write_chapter(state: State, ch: Chapter, idx: int,
+                  feedback: str = "") -> Chapter:
+    """Пишет текст главы (диалоги + адалт внутри) по её ПЛАНУ.
 
-    fb = state.get("revision_feedback") or ""
+    Общий код для Бота 5 (нода) и для ручной перегенерации главы из UI
+    (правка плана → переписать диалог). Возвращает обновлённый ch
+    (dialogue/statics/anims). Адалт-глава пишется uncensored-моделью.
+    """
     user = (
         f"Карточки персонажей:\n{state['characters']}\n\n"
+        f"Номер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
         f"Глава для написания:\n{ch.title}\n{ch.plan}"
     )
-    if fb and state.get("revision_target") == "dialogue":
-        user += f"\n\nТекущий черновик главы:\n{ch.dialogue or ''}\n\n{fb}"
+    if feedback:
+        user += f"\n\nТекущий черновик главы:\n{ch.dialogue or ''}\n\n{feedback}"
     user += (
         "\n\nВыведи ТОЛЬКО готовый текст этой главы в заданном формате "
         "визуальной новеллы. Никаких преамбул, вопросов, комментариев и "
         "пояснений. Если это правка — верни ПОЛНУЮ переписанную главу целиком."
     )
+    is_adult = bool(ch.is_adult_point)
+    if is_adult:
+        system = (_sys(state, prompts.DIALOGUE, names=True)
+                  + prompts.DIALOGUE_ADULT_EXTRA + prompts.STATICS_ADULT)
+        # #1: канон-гард участников — держит характер, не тонет в карточках
+        user += prompts.ADULT_CANON_GUARD.format(
+            pair=ch.adult_note or "см. карточки персонажей")
+        llm = _adult()
+    else:
+        system = _sys(state, prompts.DIALOGUE, names=True) + prompts.STATICS_DIALOGUE
+        # модель = подписка Claude (если вкл) ИНАЧЕ фоллбек на OpenRouter-ключ
+        llm = _structural()
 
-    ch.dialogue = _structural().complete(_sys(state, prompts.DIALOGUE, names=True), user)
+    try:
+        out = llm.structured(system, user, DialogueOut, temperature=0.7)
+        ch.dialogue, ch.statics, ch.anims = out.script, out.statics, out.anims
+    except Exception:
+        ch.dialogue = llm.complete(system, user)
+    ch.adult_scene = None  # адалт теперь внутри ch.dialogue, не вставкой
+    # #4: адалт-сцена вышла короткой → один добор объёма (grok иногда мельчит)
+    if is_adult and _too_short(ch.dialogue):
+        try:
+            out = llm.structured(system, user + prompts.ADULT_EXPAND,
+                                 DialogueOut, temperature=0.7)
+            if out.script and len(out.script) > len(ch.dialogue or ""):
+                ch.dialogue, ch.statics, ch.anims = out.script, out.statics, out.anims
+        except Exception:
+            pass
+    return ch
+
+
+_MIN_ADULT_CHARS = 2500  # порог «слишком короткой» адалт-сцены
+
+
+def _too_short(text: str | None) -> bool:
+    t = text or ""
+    return len(t) < _MIN_ADULT_CHARS or t.count('"') < 24
+
+
+def _open_findings_for(state: State, idx: int) -> list[Finding]:
+    """Не отклонённые findings последнего отчёта редактора по главе idx."""
+    from .routing import apply_decisions  # noqa: PLC0415
+    reports = [r for r in (state.get("editor_reports") or [])
+               if r.chapter_index == idx]
+    if not reports:
+        return []
+    last = apply_decisions(reports[-1], state.get("finding_decisions") or {})
+    return [f for f in last.findings if f.status != "rejected"]
+
+
+def patch_chapter(state: State, ch: Chapter, idx: int,
+                  findings: list[Finding], extra: str = "") -> Chapter:
+    """ТОЧЕЧНАЯ правка главы: чинит ТОЛЬКО фрагменты из замечаний редактора,
+    остальной текст возвращается дословно. Заменяет перегенерацию всей главы —
+    так критичные реально устраняются, а не плодятся новые.
+    """
+    items = []
+    for f in findings:
+        q = (f.quote or "").strip()
+        if q:
+            items.append(f'- Фрагмент: «{q}»\n  Проблема [{f.block}]: {f.problem}')
+        else:
+            items.append(f"- {f.locator} [{f.block}]: {f.problem}")
+    issues = "\n".join(items) if items else "(конкретных замечаний нет)"
+
+    is_adult = bool(ch.is_adult_point)
+    if is_adult:
+        system = (_sys(state, prompts.DIALOGUE, names=True)
+                  + prompts.DIALOGUE_ADULT_EXTRA + prompts.STATICS_ADULT)
+        llm = _adult()
+    else:
+        system = (_sys(state, prompts.DIALOGUE, names=True)
+                  + prompts.STATICS_DIALOGUE)
+        llm = _structural()
+
+    user = (
+        f"Карточки персонажей (канон):\n{state['characters']}\n\n"
+        f"Номер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
+        f"ТЕКУЩИЙ ТЕКСТ ГЛАВЫ «{ch.title}»:\n{ch.dialogue or ''}\n\n"
+        f"ЗАМЕЧАНИЯ РЕДАКТОРА — исправь ТОЧЕЧНО только эти места:\n{issues}"
+    )
+    if extra.strip():
+        user += (f"\n\nОБСУЖДЕНИЕ с нарративщиком (учти решения и формулировки):"
+                 f"\n{extra}")
+    if is_adult:  # #1: держать канон участников и при правке
+        user += prompts.ADULT_CANON_GUARD.format(
+            pair=ch.adult_note or "см. карточки персонажей")
+    user += prompts.PATCH_CONTRACT
+
+    try:
+        out = llm.structured(system, user, DialogueOut, temperature=0.4)
+        ch.dialogue, ch.statics, ch.anims = out.script, out.statics, out.anims
+    except Exception:
+        ch.dialogue = llm.complete(system, user)
+    ch.adult_scene = None
+    return ch
+
+
+def sync_plan_from_dialogue(state: State, ch: Chapter, idx: int) -> str:
+    """Подгоняет ПЛАН главы под уже написанный ДИАЛОГ (обратная синхронизация).
+
+    Когда нарративщик правит текст главы вручную — план обновляем, чтобы он
+    отражал реальные события/повороты/адалт написанной главы.
+    """
+    user = (
+        f"Карточки персонажей:\n{state['characters']}\n\n"
+        f"Готовый текст главы {idx + 1} «{ch.title}»:\n{ch.dialogue or ''}\n\n"
+        f"Текущий план главы:\n{ch.plan}\n\n"
+        "Обнови план этой главы так, чтобы он ТОЧНО отражал написанный текст: "
+        "локации, что происходит, эмоциональная дуга, точки выбора, адалт-точка. "
+        "Верни только новый план главы, без преамбул."
+    )
+    return _structural().complete(
+        _sys(state, prompts.STRUCTURE, names=True), user)
+
+
+def dialogue_node(state: State) -> dict:
+    idx = state["chapter_idx"]
+    chapters = list(state["chapters"])
+    ch = chapters[idx]
+    is_revision = (state.get("revision_target") == "dialogue"
+                   and bool(state.get("revision_feedback")))
+    if is_revision:
+        # ревизия → ТОЧЕЧНАЯ правка по конкретным замечаниям редактора
+        findings = _open_findings_for(state, idx)
+        if findings:
+            ch = patch_chapter(state, ch, idx, findings)
+            verb = "правка"
+        else:  # нет структурных findings (напр. ручной фидбек) → обычная перепись
+            ch = write_chapter(state, ch, idx, state.get("revision_feedback") or "")
+            verb = "переписана"
+    else:
+        ch = write_chapter(state, ch, idx)
+        verb = "написана"
     chapters[idx] = ch
+    tag = " (с адалтом)" if ch.is_adult_point else ""
     return {
         "chapters": chapters,
         "revision_feedback": None,
         "revision_target": None,
-        "log": [f"✓ Бот 5: глава {idx + 1} «{ch.title}» написана"],
+        "log": [f"✓ Бот 5: глава {idx + 1} «{ch.title}» {verb}{tag}"],
     }
 
 
@@ -255,6 +561,7 @@ def adult_node(state: State) -> dict:
     is_revision = bool(fb) and state.get("revision_target") == "adult"
     ctx = (
         f"Карточки персонажей:\n{state['characters']}\n\n"
+        f"Номер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
         f"Контекст сцены (глава «{ch.title}»):\n{ch.dialogue or ch.plan}"
     )
 
@@ -283,15 +590,17 @@ def adult_node(state: State) -> dict:
     if is_revision:
         user += f"\n\nТекущая адалт-сцена:\n{ch.adult_scene or ''}\n\n{fb}"
     user += pair_hint
-    # Контракт + директива глубины: сцена всегда раскрывается на «уровень C».
-    user += prompts.ADULT_SCENE_DIRECTIVE + prompts.NAMES_RULE
+    # Контракт + директива глубины + плотные статики/анимации для художника.
+    user += prompts.ADULT_SCENE_DIRECTIVE + prompts.STATICS_ADULT + prompts.NAMES_RULE
 
     # Строгий JSON-контракт: отказ — поле refused, а не текст для парсинга.
     llm = _adult()
+    a_statics, a_anims = [], []
     try:
         res = llm.structured(prompts.ADULT, user + prompts.ADULT_JSON_CONTRACT,
                              AdultSceneOut, temperature=llm.cfg.temperature)
         refused, reason, scene = res.refused, res.reason, res.scene
+        a_statics, a_anims = res.statics, res.anims
     except Exception:  # модель/провайдер не вытянул JSON → фолбэк на маркеры
         raw = llm.complete(prompts.ADULT, user)
         refused = _looks_like_refusal(raw)
@@ -315,6 +624,8 @@ def adult_node(state: State) -> dict:
         }
 
     ch.adult_scene = scene
+    ch.adult_statics = a_statics
+    ch.adult_anims = a_anims
     ch.adult_block_reason = None
     ch.adult_bridge_hint = None
     chapters[idx] = ch
@@ -350,6 +661,18 @@ def editor_node(state: State) -> dict:
         f"Номер главы: {idx}\nНазвание: {ch.title}\n\n"
         f"Текст главы для проверки:\n{full_text}"
     )
+    # #2: для адалт-главы характерные нюансы в сексе судим мягче — иначе цикл
+    # правок застревает на спорных critical, которые grok всё равно не закроет.
+    if ch.is_adult_point:
+        user += prompts.EDITOR_ADULT_LENIENCY
+    # #8: нарративщик уже отклонил эти претензии — НЕ поднимать их снова.
+    rejected = state.get("rejected_notes") or []
+    if rejected:
+        joined = "\n".join(f"- {n}" for n in rejected[-30:])
+        user += (
+            "\n\nНарративщик УЖЕ ОТКЛОНИЛ эти претензии как несущественные — "
+            f"НЕ повторяй их и ничего похожего:\n{joined}"
+        )
     try:
         out: EditorReportOut = _editor().structured(prompts.EDITOR, user, EditorReportOut)
     except Exception as exc:

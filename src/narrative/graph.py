@@ -63,7 +63,39 @@ def _after_editor(state: State) -> str:
         if _critical_count(last) >= _critical_count(prev):
             return "advance"
 
-    return f"revise:{target}"
+    return "revise"  # цель всегда dialogue (адалт там же) — клампится в routing
+
+
+def _after_dialogue(state: State) -> str:
+    """После написания главы (Бот 5):
+    - фаза edit → это была правка по замечаниям → к редактору;
+    - фаза content → следующая глава, а когда все написаны → старт фазы edit.
+    """
+    if state.get("phase") == "edit":
+        return "to_editor"
+    if state["chapter_idx"] + 1 < len(state["chapters"]):
+        return "more_content"
+    return "to_edit"
+
+
+def _edit_advance(state: State) -> str:
+    """После проверки главы редактором: следующая глава на проверку или перевод."""
+    if state["chapter_idx"] + 1 < len(state["chapters"]):
+        return "edit_next"
+    return "translation"
+
+
+def _content_next(state: State) -> dict:
+    return {"chapter_idx": state["chapter_idx"] + 1}
+
+
+def _edit_start(state: State) -> dict:
+    return {"chapter_idx": 0, "phase": "edit",
+            "log": ["— весь контент написан, редактор начинает проверку"]}
+
+
+def _edit_next(state: State) -> dict:
+    return {"chapter_idx": state["chapter_idx"] + 1}
 
 
 def _after_structure(state: State) -> str:
@@ -74,7 +106,8 @@ def _after_structure(state: State) -> str:
     В step-mode interrupt_after['structure'] ставит паузу после КАЖДОЙ порции —
     нарративщик ревьюит/правит и командует «ещё» или «перейти к написанию».
     """
-    return "dialogue" if state.get("structure_done") else "structure"
+    # структура готова → сперва РЕДАКТОР СТРУКТУРЫ (#2), потом написание глав
+    return "structure_editor" if state.get("structure_done") else "structure"
 
 
 def _advance_or_finish(state: State) -> str:
@@ -111,8 +144,8 @@ def sqlite_saver(path: str = "narrative_state.db") -> SqliteSaver:
 
 # Стадии, после которых можно вставать на паузу (step-mode для ручных правок).
 STAGE_NODES = [
-    "logline", "synopsis", "characters", "structure",
-    "dialogue", "adult", "editor", "translation",
+    "logline", "synopsis", "characters", "chapter_count", "structure",
+    "structure_editor", "dialogue", "editor", "translation",
 ]
 
 
@@ -123,53 +156,43 @@ def build_graph(checkpointer=None, interrupt_after=None):
     g.add_node("logline", nodes.logline_node)
     g.add_node("synopsis", nodes.synopsis_node)
     g.add_node("characters", nodes.characters_node)
+    g.add_node("chapter_count", nodes.chapter_count_node)
     g.add_node("structure", nodes.structure_node)
+    g.add_node("structure_editor", nodes.structure_editor_node)
     g.add_node("dialogue", nodes.dialogue_node)
-    g.add_node("adult", nodes.adult_node)
     g.add_node("editor", nodes.editor_node)
     g.add_node("translation", nodes.translation_node)
     g.add_node("bump_retry", nodes.bump_retry_node)
 
-    # узлы-сеттеры правки (по одному на возможную цель)
-    for tgt in ("dialogue", "adult", "characters", "structure"):
-        g.add_node(f"revise_to_{tgt}", _set_revision(tgt))
+    # узел-сеттер правки (единственная цель — dialogue, адалт пишется там же)
+    g.add_node("revise_to_dialogue", _set_revision("dialogue"))
+    g.add_node("advance_router", lambda s: {})  # развилка: след. глава / перевод
     g.add_node("next_chapter", _next_chapter)
 
     # линейная часть
     g.add_edge(START, "logline")
     g.add_edge("logline", "synopsis")
     g.add_edge("synopsis", "characters")
-    g.add_edge("characters", "structure")
-    # структура порциями: петля structure→structure, пока не structure_done
-    g.add_conditional_edges("structure", _after_structure, {
-        "structure": "structure",
-        "dialogue": "dialogue",
-    })
+    # после персонажей — предложение числа глав (пауза на апрув), затем структура
+    g.add_edge("characters", "chapter_count")
+    g.add_edge("chapter_count", "structure")
+    # структура пишется сразу на target_chapters → редактор структуры (#2)
+    g.add_edge("structure", "structure_editor")
+    g.add_edge("structure_editor", "dialogue")
 
-    # поглавный цикл
-    g.add_edge("dialogue", "adult")
-    g.add_edge("adult", "editor")
-
+    # ПОГЛАВНЫЙ ЦИКЛ: каждая глава пишется и СРАЗУ проверяется редактором.
+    # К следующей главе переходим ТОЛЬКО после проверки текущей. Полное
+    # исправление держит UI-гейт (нельзя resume, пока есть открытые замечания)
+    # и цикл правок apply_revision.
+    g.add_edge("dialogue", "editor")
     g.add_conditional_edges("editor", _after_editor, {
         "advance": "advance_router",
-        "revise:dialogue": "revise_to_dialogue",
-        "revise:adult": "revise_to_adult",
-        "revise:characters": "revise_to_characters",
-        "revise:structure": "revise_to_structure",
+        "revise": "revise_to_dialogue",
     })
+    g.add_edge("revise_to_dialogue", "bump_retry")
+    g.add_edge("bump_retry", "dialogue")  # правка → переписать главу → к редактору
 
-    # после сеттера правки — учёт попытки, затем к боту-виновнику
-    for tgt in ("dialogue", "adult", "characters", "structure"):
-        g.add_edge(f"revise_to_{tgt}", "bump_retry")
-    g.add_conditional_edges("bump_retry", lambda s: s["revision_target"], {
-        "dialogue": "dialogue",
-        "adult": "adult",
-        "characters": "characters",   # правка карточки → пересборка ниже
-        "structure": "structure",
-    })
-
-    # роутер «дальше»: следующая глава или перевод
-    g.add_node("advance_router", lambda s: {})
+    # глава проверена → следующая глава или перевод
     g.add_conditional_edges("advance_router", _advance_or_finish, {
         "next_chapter": "next_chapter",
         "translation": "translation",

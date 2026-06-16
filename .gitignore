@@ -17,6 +17,11 @@ narrative_state.db
 narrative_state.db-shm
 narrative_state.db-wal
 *.db
+*.db.old
+
+# --- артефакты Playwright-прогона (скриншоты/снапшоты) ---
+web/.playwright-mcp/
+.playwright-mcp/
 
 # --- Node / Next ---
 web/node_modules/
