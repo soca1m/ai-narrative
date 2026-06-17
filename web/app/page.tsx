@@ -3,6 +3,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
+  Play, Plus, FolderOpen, Download, RotateCw, Undo2, Check, X,
+  ChevronDown, ChevronRight, MessageSquare, Sparkles, Wrench, Link2,
+  ScanSearch, SendHorizontal, AlertTriangle, Loader2, BookOpenText,
+  CircleCheckBig, RefreshCw, Wand2, ArrowRight, Circle, Minus, Pause,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import {
   Chapter,
   ChatMsg,
   EditorReport,
@@ -14,6 +21,8 @@ import {
   applyChatToChapter,
   applyRevision,
   exportProject,
+  RunSummary,
+  listRuns,
   claudeStatus,
   claudeAuthUrl,
   claudeExchange,
@@ -114,8 +123,9 @@ function classifyLog(lines: string[]): Ev[] {
   });
 }
 
-const EV_ICON: Record<string, string> = {
-  approve: "✓", rollback: "↩", revise: "✦", escalate: "⚠", skip: "·", bot: "●",
+const EV_ICON: Record<string, LucideIcon> = {
+  approve: Check, rollback: Undo2, revise: Wand2,
+  escalate: AlertTriangle, skip: Minus, bot: Circle,
 };
 
 function critCount(r: EditorReport) {
@@ -199,6 +209,18 @@ export default function Page() {
   const [dirty, setDirty] = useState<Set<string>>(new Set());
   const [saved, setSaved] = useState<string | null>(null);
   const [countInput, setCountInput] = useState<number | "">("");
+
+  // список прошлых работ (продолжить оборванную / скачать)
+  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [showRuns, setShowRuns] = useState(false);
+  async function loadRuns() {
+    try { const r = await listRuns(); setRuns(r.runs); } catch {}
+  }
+  function openRun(tid: string) {
+    if (pollRef.current) clearTimeout(pollRef.current);
+    setErr(null); setDirty(new Set()); setDrafts({}); setShowRuns(false);
+    setThreadId(tid); poll(tid);
+  }
 
   const events = useMemo(() => classifyLog(st.log ?? []), [st.log]);
   const rollbackTick = useMemo(
@@ -390,8 +412,37 @@ export default function Page() {
         <ClaudeSubPanel />
 
         <button className="wide" onClick={onStart} disabled={busy}>
-          {threadId ? "↻ Запустить заново" : "▶ Запустить пайплайн"}
+          {threadId ? <><Plus size={16} /> Новая работа</>
+                    : <><Play size={16} /> Запустить пайплайн</>}
         </button>
+
+        <button className="wide secondary" style={{ marginTop: 8 }}
+          onClick={() => { const v = !showRuns; setShowRuns(v); if (v) loadRuns(); }}>
+          <FolderOpen size={16} /> Мои работы{runs.length ? ` (${runs.length})` : ""}
+        </button>
+        {showRuns && (
+          <div className="runs">
+            {runs.length === 0 && <div className="runs-empty">пусто — запусти первую</div>}
+            {runs.map((r) => (
+              <div key={r.thread_id} className={`run-item ${r.thread_id === threadId ? "cur" : ""}`}>
+                <div className="run-meta" onClick={() => openRun(r.thread_id)} title="Открыть / продолжить">
+                  <div className="run-theme">{r.theme || "(без темы)"}</div>
+                  <div className="run-sub">
+                    {r.written}/{r.chapters} глав · {r.status}
+                    {r.thread_id === threadId ? " · открыта" : ""}
+                  </div>
+                </div>
+                <button className="xs ghost icon" title="Скачать .txt"
+                  onClick={async () => {
+                    try {
+                      const ex = await exportProject(r.thread_id, "txt");
+                      downloadText(ex.filename, ex.text);
+                    } catch { setErr("Не удалось выгрузить работу"); }
+                  }}><Download size={14} /></button>
+              </div>
+            ))}
+          </div>
+        )}
 
         {threadId && (
           <>
@@ -401,16 +452,16 @@ export default function Page() {
             </div>
             {err && (
               <div className="errbox">
-                <div className="errt">⚠ Ошибка</div>
+                <div className="errt"><AlertTriangle size={15} /> Ошибка</div>
                 <div className="errm">{err}</div>
                 {status === "error"
-                  ? <button className="wide" onClick={() => { setErr(null); onResume(); }}>↻ Повторить</button>
+                  ? <button className="wide" onClick={() => { setErr(null); onResume(); }}><RotateCw size={15} /> Повторить</button>
                   : <button className="wide ghost" onClick={() => setErr(null)}>Закрыть</button>}
               </div>
             )}
             {busy && (
               <div className="working">
-                <span className="wk-dot" />
+                <Loader2 size={15} className="spin" />
                 ИИ работает… {curEdited
                   ? `правка главы ${curIdx + 1}`
                   : nextLabel(next).toLowerCase()}
@@ -419,13 +470,13 @@ export default function Page() {
             {status === "paused" && !pausedAtCount && !gating && (
               <button className="wide" onClick={onResume}>
                 {curEdited
-                  ? `✓ Глава ${curIdx + 1} готова — следующая`
-                  : `⏭ Продолжить · ${nextLabel(next)}`}
+                  ? <><Check size={16} /> Глава {curIdx + 1} готова — следующая</>
+                  : <><ArrowRight size={16} /> Продолжить · {nextLabel(next)}</>}
               </button>
             )}
             {gating && (
               <div className="gate">
-                <div className="gate-t">🔎 Редактор · глава {curIdx + 1}</div>
+                <div className="gate-t"><ScanSearch size={15} /> Редактор · глава {curIdx + 1}</div>
                 <div className="gate-h">
                   {curOpenAll} незакрыт{curOpenAll === 1 ? "ое замечание" : "ых замечаний"}
                   {curOpenCrit > 0 ? ` (из них ${curOpenCrit} критич.)` : ""}.
@@ -453,14 +504,16 @@ export default function Page() {
                       setApplyingRev(false);
                     }
                   }}>
-                  {applyingRev ? "⏳ Запускаю правку…" : "✓ Исправить всё и перепроверить"}
+                  {applyingRev
+                    ? <><Loader2 size={15} className="spin" /> Запускаю правку…</>
+                    : <><Check size={16} /> Исправить всё и перепроверить</>}
                 </button>
               </div>
             )}
             {pausedAtCount && (
               <div className="batch-ctl">
                 <div className="hint">
-                  📖 ИИ предлагает <b>{st.suggested_chapters}</b> глав.
+                  <BookOpenText size={14} style={{ verticalAlign: "-2px" }} /> ИИ предлагает <b>{st.suggested_chapters}</b> глав.
                   {st.count_reason ? <><br />{st.count_reason}</> : null}
                 </div>
                 <div className="row" style={{ gap: 8 }}>
@@ -474,7 +527,7 @@ export default function Page() {
                   await setChapterCount(threadId, n);
                   setStatus("running"); setCountInput(""); poll(threadId);
                 }}>
-                  ✓ Писать {countInput || st.suggested_chapters} глав
+                  <Check size={16} /> Писать {countInput || st.suggested_chapters} глав
                 </button>
               </div>
             )}
@@ -485,7 +538,7 @@ export default function Page() {
                 {[...events].reverse().map((e) => (
                   <motion.div key={e.i} className={`ev ${e.kind}`} layout
                     initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}>
-                    <span className="ic">{EV_ICON[e.kind] ?? "●"}</span>
+                    <span className="ic">{(() => { const EI = EV_ICON[e.kind] ?? Circle; return <EI size={13} />; })()}</span>
                     <div className="body"><div className="t">{e.text.replace(/^[✓·⚠]\s*/, "")}</div></div>
                   </motion.div>
                 ))}
@@ -511,15 +564,15 @@ export default function Page() {
             {projectDone && (
               <motion.div className="proj-done" initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}>
-                <div className="done-t">✅ Проект готов</div>
+                <div className="done-t"><CircleCheckBig size={20} /> Проект готов</div>
                 <div className="done-d">
                   Все {st.chapters?.length ?? 0} глав написаны и проверены
                   редактором. Можно скачать готовый текст новеллы.
                 </div>
                 <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
-                  <button onClick={() => onDownload("txt")}>📥 Скачать .txt</button>
-                  <button className="ghost" onClick={() => onDownload("md")}>
-                    📥 Скачать .md
+                  <button onClick={() => onDownload("txt")}><Download size={16} /> Скачать .txt</button>
+                  <button className="secondary" onClick={() => onDownload("md")}>
+                    <Download size={16} /> Скачать .md
                   </button>
                 </div>
               </motion.div>
@@ -531,7 +584,7 @@ export default function Page() {
                 const cls = activeStage === k ? "active" : has[k] ? "done" : "";
                 return (
                   <div key={k} className={`node ${cls} ${off ? "off" : ""}`}>
-                    <span className="ix">{ix}</span>{label}{off ? " ⏸" : ""}
+                    <span className="ix">{ix}</span>{label}{off && <Pause size={9} style={{ marginLeft: 4 }} />}
                   </div>
                 );
               })}
@@ -539,7 +592,7 @@ export default function Page() {
 
             {/* ghost-превью: что сейчас генерируется / появится следующим */}
             {activeStage && STAGE_DESC[activeStage] && !has[activeStage] && (
-              <motion.div className="ghost" layout
+              <motion.div className="preview" layout
                 initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}>
                 <span className={`ghost-dot ${status === "running" ? "live" : ""}`} />
                 <div>
@@ -564,7 +617,7 @@ export default function Page() {
 
             {(st.structure_fixes?.length ?? 0) > 0 && (
               <div className="sfixes">
-                <div className="sft">🛠 Редактор структуры исправил план ({st.structure_fixes!.length}):</div>
+                <div className="sft"><Wrench size={14} /> Редактор структуры исправил план ({st.structure_fixes!.length}):</div>
                 {st.structure_fixes!.map((fx, i) => <div key={i} className="sfi">· {fx}</div>)}
               </div>
             )}
@@ -645,7 +698,7 @@ function ReviseBox({ label, onRevise, disabled }: {
   const [open, setOpen] = useState(false);
   const [fb, setFb] = useState("");
   const [busy, setBusy] = useState(false);
-  if (!open) return <button className="small ghost" disabled={disabled} onClick={() => setOpen(true)}>✦ {label ?? "Попросить ИИ переделать"}</button>;
+  if (!open) return <button className="small ghost" disabled={disabled} onClick={() => setOpen(true)}><Wand2 size={14} /> {label ?? "Попросить ИИ переделать"}</button>;
   return (
     <div className="revise">
       <textarea rows={2} placeholder="Что изменить? напр. «больше внутреннего конфликта у героя»"
@@ -696,11 +749,11 @@ function EditableCard(props: {
       <div className="head">
         <span className="t"><span className="botnum">{props.bot}</span>{props.title}</span>
         <span className="row">
-          {props.saved && <span className="saved">✓ сохранено</span>}
+          {props.saved && <span className="saved"><Check size={13} /> сохранено</span>}
           <button className="small" disabled={!props.dirty || props.busy} onClick={props.onSave}>Сохранить</button>
           {props.onRollback && (
             <button className="small ghost" disabled={props.busy} onClick={props.onRollback}
-              title="Удалить результат этого этапа и сгенерировать заново">↩ Откат</button>
+              title="Удалить результат этого этапа и сгенерировать заново"><Undo2 size={14} /> Откат</button>
           )}
         </span>
       </div>
@@ -798,17 +851,17 @@ function Chapters(props: {
         <span className="row" style={{ marginLeft: "auto", gap: 8 }}>
           {props.canDownload && props.onDownload && (
             <button className="small ghost" disabled={props.busy} onClick={() => props.onDownload!("txt")}
-              title="Скачать собранный текст всех глав">📥 Скачать</button>
+              title="Скачать собранный текст всех глав"><Download size={14} /> Скачать</button>
           )}
           {props.rollbackStage === "dialogue" && (
             <button className="small ghost" disabled={props.busy} onClick={props.onRollbackWriting}
-              title="Удалить все тексты глав и написать заново (план сохранится)">↩ Откат — написание</button>
+              title="Удалить все тексты глав и написать заново (план сохранится)"><Undo2 size={14} /> Откат — написание</button>
           )}
           {props.rollbackStage === "structure" && (
             <button className="small ghost" disabled={props.busy} onClick={props.onRollbackStructure}
-              title="Удалить план глав и сгенерировать структуру заново">↩ Откат — структура</button>
+              title="Удалить план глав и сгенерировать структуру заново"><Undo2 size={14} /> Откат — структура</button>
           )}
-          {dirty && <button className="small" disabled={props.busy} onClick={commit}>Сохранить главы</button>}
+          {dirty && <button className="small" disabled={props.busy} onClick={commit}><Check size={14} /> Сохранить главы</button>}
         </span>
       </h2>
       {[...props.chapters].sort((a, b) => b.index - a.index).map((c) => {
@@ -823,15 +876,15 @@ function Chapters(props: {
         return (
           <div className={`card chapter ${c.is_adult_point ? "adultcard" : ""} ${openN > 0 ? "needs" : ""}`} key={c.index}>
             <button className="chap-head" onClick={() => toggle(c.index)}>
-              <span className="caret">{open ? "▾" : "▸"}</span>
+              <span className="caret">{open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}</span>
               <span className="t">Глава {c.index + 1} · {c.title}</span>
-              {c.is_adult_point && <span className="adult">🔞</span>}
+              {c.is_adult_point && <span className="tag18">18+</span>}
               {verdict === "needs" && (
                 <span className={`cbadge ${crit > 0 ? "crit" : "warn"}`}>
-                  {crit > 0 ? "🔴" : "🟡"} {openN} — решить
+                  <span className={`sevdot ${crit > 0 ? "crit" : "imp"}`} /> {openN} — решить
                 </span>
               )}
-              {verdict === "ok" && <span className="cbadge ok">✓ готова</span>}
+              {verdict === "ok" && <span className="cbadge ok"><Check size={12} /> готова</span>}
               {c.dialogue == null && <span className="cbadge wait">черновик плана</span>}
             </button>
             {open && (<>
@@ -839,7 +892,7 @@ function Chapters(props: {
             {/* пре-чек адалта: главе не из чего генерить сцену */}
             {c.adult_block_reason && (
               <div className="adult-warn">
-                <div className="wt">⚠ Адалт не сгенерирован — нет почвы в главе</div>
+                <div className="wt"><AlertTriangle size={14} /> Адалт не сгенерирован — нет почвы в главе</div>
                 <div className="wr">{c.adult_block_reason}</div>
                 {c.adult_bridge_hint && (
                   <div className="wh">Подсказка: {c.adult_bridge_hint}</div>
@@ -850,7 +903,9 @@ function Chapters(props: {
                       setAdapting(c.index);
                       try { await props.onAdaptAdult(c.index); } finally { setAdapting(null); }
                     }}>
-                    {adapting === c.index ? "Адаптирую…" : "🔧 Адаптировать главу под адалт"}
+                    {adapting === c.index
+                      ? <><Loader2 size={14} className="spin" /> Адаптирую…</>
+                      : <><Wrench size={14} /> Адаптировать главу под адалт</>}
                   </button>
                   <button className="small ghost" disabled={adapting === c.index || props.busy}
                     onClick={() => props.onSkipAdult(c.index)}>
@@ -880,13 +935,13 @@ function Chapters(props: {
                     <div className="rh">
                       <span className="lbl">ревизия {k + 1}</span>
                       <span className="counts">
-                        <span className="c-crit">🔴 {critCount(r)}</span>
-                        <span className="c-imp">🟡 {impCount(r)}</span>
-                        <span className="c-min">🟢 {minCount(r)}</span>
+                        <span className="countpair c-crit"><span className="sevdot crit" />{critCount(r)}</span>
+                        <span className="countpair c-imp"><span className="sevdot imp" />{impCount(r)}</span>
+                        <span className="countpair c-min"><span className="sevdot min" />{minCount(r)}</span>
                       </span>
                     </div>
                     {r.findings.length === 0 && (
-                      <div className="round-clean">✓ замечаний нет</div>
+                      <div className="round-clean"><Check size={13} /> замечаний нет</div>
                     )}
                     {r.findings.map((f) => (
                       <FindingRow key={f.id} f={f} active={activeFinding === f.id}
@@ -902,10 +957,12 @@ function Chapters(props: {
             <textarea rows={3} value={val(i, "plan", c.plan)} onChange={(e) => upd(i, "plan", e.target.value)} />
             <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
               {c.dialogue != null && (
-                <button className="small" disabled={working === `rw${i}` || props.busy}
+                <button className="small secondary" disabled={working === `rw${i}` || props.busy}
                   title="Сохранить план и переписать диалоги главы под него"
                   onClick={() => withWork(`rw${i}`, () => props.onRewriteDialogue(i))}>
-                  {working === `rw${i}` ? "Переписываю…" : "↻ План → переписать диалоги"}
+                  {working === `rw${i}`
+                    ? <><Loader2 size={14} className="spin" /> Переписываю…</>
+                    : <><RefreshCw size={14} /> План → переписать диалоги</>}
                 </button>
               )}
               <ReviseBox label="Попросить ИИ изменить план главы" disabled={props.busy} onRevise={(fb) => props.onReviseChapter(i, fb)} />
@@ -920,7 +977,9 @@ function Chapters(props: {
               <button className="small ghost" disabled={working === `sp${i}` || props.busy}
                 title="Сохранить текст и подогнать план главы под написанное"
                 onClick={() => withWork(`sp${i}`, () => props.onSyncPlan(i))}>
-                {working === `sp${i}` ? "Синхронизирую…" : "↻ Диалоги → обновить план"}
+                {working === `sp${i}`
+                  ? <><Loader2 size={14} className="spin" /> Синхронизирую…</>
+                  : <><RefreshCw size={14} /> Диалоги → обновить план</>}
               </button>
             </>)}
             {c.adult_scene != null && (<>
@@ -957,7 +1016,7 @@ function FindingRow({
       <div className="meta">
         [{f.block}] · {f.locator}
         <span className={`fstatus ${f.status}`}>
-          {rejected ? "✕ не менять" : "будет исправлено"}
+          {rejected ? "не менять" : "будет исправлено"}
         </span>
       </div>
       <div className="fprob">{f.problem}</div>
@@ -968,13 +1027,13 @@ function FindingRow({
         {rejected ? (
           <button className="xs ghost" disabled={!!busy || disabled}
             onClick={() => act("open", "open")}>
-            {busy === "open" ? "…" : "↩ Вернуть в правки"}
+            {busy === "open" ? "…" : <><Undo2 size={13} /> Вернуть в правки</>}
           </button>
         ) : (
           <button className="xs no" disabled={!!busy || disabled}
             title="ИИ не будет это менять при перепроверке"
             onClick={() => act("rej", "rejected")}>
-            {busy === "rej" ? "…" : "✕ Не менять это"}
+            {busy === "rej" ? "…" : <><X size={13} /> Не менять это</>}
           </button>
         )}
       </div>
@@ -995,8 +1054,9 @@ function RevisionPanel({
   return (
     <div className="revpanel">
       <div className="rp-head">
+        {openCrit > 0 && <span className="sevdot crit" />}
         {openCrit > 0
-          ? `🔴 ${openCrit} критич. — исправь (слева «Исправить всё»), иначе дальше не пойдём`
+          ? `${openCrit} критич. — исправь (слева «Исправить всё»), иначе дальше не пойдём`
           : "Замечания не критичны. Обсуди при необходимости и жми «Исправить всё» слева"}
       </div>
       <ChatBox threadId={threadId} chapterIdx={idx} storageKey={key}
@@ -1046,7 +1106,7 @@ function ChatBox({
       });
       setMsgs([...next, { role: "assistant", content: reply }]);
     } catch {
-      setMsgs([...next, { role: "assistant", content: "⚠ Ошибка запроса — попробуй ещё раз." }]);
+      setMsgs([...next, { role: "assistant", content: "Ошибка запроса — попробуй ещё раз." }]);
     } finally { setBusy(false); }
   }
 
@@ -1055,24 +1115,24 @@ function ChatBox({
     setBusy(true); setApplyMsg(null);
     try {
       const r = await applyChatToChapter(threadId, chapterIdx, msgs);
-      setApplyMsg(r.changed ? `✓ Глава изменена: ${r.note}` : `• Без изменений: ${r.note}`);
+      setApplyMsg(r.changed ? `Глава изменена: ${r.note}` : `Без изменений: ${r.note}`);
       if (r.changed) onApplied?.();
     } catch {
-      setApplyMsg("⚠ Не удалось применить");
+      setApplyMsg("Не удалось применить");
     } finally { setBusy(false); }
   }
 
   if (!open) {
     return (
-      <button className="small ghost" onClick={() => setOpen(true)}>
-        💬 {title}{msgs.length > 0 ? ` (${msgs.length})` : ""}
+      <button className="small ghost" disabled={disabled} onClick={() => setOpen(true)}>
+        <MessageSquare size={14} /> {title}{msgs.length > 0 ? ` (${msgs.length})` : ""}
       </button>
     );
   }
   return (
     <div className="chatbox">
       <div className="ch-head">
-        <span>💬 {title}</span>
+        <span className="ch-title"><MessageSquare size={14} /> {title}</span>
         <span className="row" style={{ gap: 6 }}>
           {msgs.length > 0 && <button className="xs ghost" onClick={() => { setMsgs([]); setApplyMsg(null); }}>очистить</button>}
           <button className="xs ghost" onClick={() => setOpen(false)}>свернуть</button>
@@ -1092,15 +1152,16 @@ function ChatBox({
         <textarea rows={2} value={text} placeholder="Сообщение…"
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
-        <button className="small" disabled={busy || !text.trim() || disabled} onClick={send}>
-          {busy ? "…" : "➤"}
+        <button className="small icon" disabled={busy || !text.trim() || disabled} onClick={send}>
+          {busy ? <Loader2 size={15} className="spin" /> : <SendHorizontal size={15} />}
         </button>
       </div>
       {!isRevisionChat && chapterIdx != null && msgs.length > 0 && (
-        <button className="small" style={{ margin: "0 12px 12px" }}
+        <button className="small secondary" style={{ margin: "0 12px 12px" }}
           disabled={busy || disabled} onClick={applyToChapter}
           title="ИИ внесёт согласованное в главу (или оставит как есть)">
-          {busy ? "Применяю…" : "✦ Применить обсуждённое к главе"}
+          {busy ? <><Loader2 size={14} className="spin" /> Применяю…</>
+                : <><Wand2 size={14} /> Применить обсуждённое к главе</>}
         </button>
       )}
     </div>
@@ -1158,7 +1219,7 @@ function ClaudeSubPanel() {
   return (
     <div className="subpanel">
       <div className="sp-head">
-        <span>⟡ Claude по подписке</span>
+        <span className="sp-title"><Sparkles size={14} /> Claude по подписке</span>
         <span className={`sp-dot ${s?.authorized ? "ok" : "no"}`} title={s?.authorized ? "подключено" : "нет авторизации"} />
       </div>
       <div className="sp-status">
@@ -1166,7 +1227,7 @@ function ClaudeSubPanel() {
           ? <>подключено{s.expires ? ` · до ${s.expires}` : ""}{s.sub ? ` · ${s.sub}` : ""}</>
           : "не авторизован"}
       </div>
-      {s?.warn && <div className="sp-warn">⚠ {s.warn}</div>}
+      {s?.warn && <div className="sp-warn"><AlertTriangle size={13} /> {s.warn}</div>}
 
       <div className="check" style={{ margin: "8px 0" }}>
         <input id="suball" type="checkbox" disabled={!s?.authorized || busy}
@@ -1181,11 +1242,11 @@ function ClaudeSubPanel() {
       </select>
 
       {!s?.authorized ? (
-        <button className="small" style={{ marginTop: 8 }} disabled={busy} onClick={connectOauth}>
-          {busy ? "…" : "🔗 Авторизоваться (откроется вкладка)"}
+        <button className="small wide" style={{ marginTop: 8 }} disabled={busy} onClick={connectOauth}>
+          {busy ? <Loader2 size={14} className="spin" /> : <Link2 size={14} />} Авторизоваться
         </button>
       ) : (
-        <button className="small ghost" style={{ marginTop: 8 }} disabled={busy} onClick={connectOauth}>
+        <button className="small ghost wide" style={{ marginTop: 8 }} disabled={busy} onClick={connectOauth}>
           Сменить аккаунт
         </button>
       )}
@@ -1193,7 +1254,7 @@ function ClaudeSubPanel() {
         <div className="sp-auth">
           {authLink && (
             <a className="sp-authlink" href={authLink} target="_blank" rel="noopener noreferrer">
-              🔗 Открыть страницу авторизации Claude
+              <Link2 size={14} /> Открыть страницу авторизации Claude
             </a>
           )}
           <div className="sp-step">1. Открой ссылку выше, войди в Claude и подтверди доступ.</div>
@@ -1203,7 +1264,7 @@ function ClaudeSubPanel() {
           <button className="small" disabled={busy || !token.trim()} onClick={exchangeCode}>
             {busy ? "…" : "Подключить"}
           </button>
-          {authErr && <div className="sp-warn">⚠ {authErr}</div>}
+          {authErr && <div className="sp-warn"><AlertTriangle size={13} /> {authErr}</div>}
           <div className="sp-note">
             Альтернатива: вставь долгоживущий токен из <code>claude setup-token</code> и нажми
             {" "}<button className="xs ghost" disabled={busy || !token.trim()} onClick={saveToken}>как токен</button>.

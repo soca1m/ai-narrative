@@ -84,6 +84,16 @@ export async function startRun(req: StartReq): Promise<{ thread_id: string }> {
   return jpost("/api/runs", req);
 }
 
+export type RunSummary = {
+  thread_id: string; theme: string; chapters: number;
+  written: number; status: string;
+};
+export const listRuns = (): Promise<{ runs: RunSummary[] }> =>
+  fetch(`${API_BASE}/api/runs`).then((r) => {
+    if (!r.ok) throw new Error(`list runs failed: ${r.status}`);
+    return r.json();
+  });
+
 export async function getState(
   threadId: string,
 ): Promise<{ status: string; next: string[]; error?: string; state: NarrativeState }> {

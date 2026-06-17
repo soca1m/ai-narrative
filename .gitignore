@@ -35,3 +35,8 @@ node_modules/
 
 # build-кэш
 web/tsconfig.tsbuildinfo
+
+# локальный инструментарий (skills CLI, агент-настройки)
+.agents/
+.claude/
+skills-lock.json

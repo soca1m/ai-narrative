@@ -105,26 +105,61 @@ input:focus, textarea:focus {
 }
 textarea { resize: vertical; line-height: 1.6; }
 
+/* ---------- единая button-система ----------
+   default = primary (ember). Модификаторы: .ghost (вторичная, контур),
+   .secondary (нейтральная заливка), .small / .xs (размер), .icon (квадрат),
+   .wide (на всю ширину). Иконка+текст выровнены через inline-flex + gap. */
 button {
   font-family: var(--font-body);
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
   background: var(--ember); color: #1b1109;
-  /* прозрачный border у ВСЕХ кнопок (border-box) → ghost с рамкой и обычные
-     одной высоты; иначе паддинги/высота прыгают между типами кнопок */
-  border: 1px solid transparent; border-radius: 7px;
-  padding: 10px 16px; font-weight: 600; font-size: 13px; line-height: 1.2;
-  cursor: pointer; transition: transform 0.12s, filter 0.2s, box-shadow 0.2s;
-  box-shadow: 0 4px 14px rgba(232,132,58,0.22);
-  vertical-align: middle;
+  border: 1px solid transparent; border-radius: 8px;
+  padding: 0 14px; height: 38px;
+  font-weight: 600; font-size: 13px; line-height: 1; white-space: nowrap;
+  cursor: pointer; transition: background 0.18s, border-color 0.18s, color 0.18s, filter 0.18s;
 }
-button:hover:not(:disabled) { filter: brightness(1.08); transform: translateY(-1px); }
-button:active:not(:disabled) { transform: translateY(0); }
-button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
-button.ghost { background: transparent; color: var(--paper); border: 1px solid var(--line2); box-shadow: none; }
-button.ghost:hover:not(:disabled) { border-color: var(--ember); color: var(--ember-soft); }
-button.small { padding: 6px 11px; font-size: 12px; }
+button:hover:not(:disabled) { filter: brightness(1.07); }
+button:active:not(:disabled) { filter: brightness(0.96); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button svg { flex-shrink: 0; }
+/* вторичная: нейтральная заливка, не кричит оранжевым */
+button.secondary { background: var(--panel2); color: var(--paper); border-color: var(--line2); }
+button.secondary:hover:not(:disabled) { border-color: var(--line2); background: #312619; filter: none; }
+/* призрак: только контур */
+button.ghost { background: transparent; color: var(--paper-dim); border-color: var(--line2); }
+button.ghost:hover:not(:disabled) { border-color: var(--ember); color: var(--ember-soft); background: rgba(232,132,58,0.06); filter: none; }
+/* размеры */
+button.small { height: 32px; padding: 0 11px; font-size: 12.5px; gap: 6px; }
+button.xs { height: 26px; padding: 0 9px; font-size: 11.5px; gap: 5px; border-radius: 6px; }
+/* icon-only — квадрат под размер */
+button.icon { padding: 0; width: 38px; }
+button.small.icon { width: 32px; }
+button.xs.icon { width: 26px; }
 button.wide { width: 100%; }
 
-.row { display: flex; gap: 9px; align-items: center; }
+/* цветные точки важности (вместо эмодзи 🔴🟡🟢) */
+.sevdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.sevdot.crit { background: var(--brick); }
+.sevdot.imp { background: var(--gold); }
+.sevdot.min { background: var(--sage); }
+.countpair { display: inline-flex; align-items: center; gap: 4px; }
+/* бейдж 18+ (вместо 🔞) */
+.tag18 { font-family: var(--font-mono); font-size: 9px; font-weight: 700; letter-spacing: 0.03em;
+  color: var(--brick-soft); border: 1px solid var(--brick); border-radius: 4px; padding: 1px 4px; }
+
+.spin { animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* выравнивание иконок (lucide svg) в заголовках/лейблах/бейджах */
+.errt, .done-t, .gate-t, .sft, .rp-head, .wt, .sp-warn, .saved,
+.sp-title, .ch-title, .round-clean, .cbadge, .tag18 {
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.gate-t, .done-t, .sft, .rp-head, .wt, .sp-warn, .errt { display: flex; }
+.cbadge { gap: 5px; }
+.ev .ic { display: inline-flex; align-items: center; }
+
+.row { display: flex; gap: 8px; align-items: center; }
 .check { display: flex; gap: 9px; align-items: flex-start; margin: 14px 0; }
 .check input { width: auto; margin-top: 2px; accent-color: var(--ember); }
 
@@ -282,7 +317,6 @@ input[type="number"] {
 }
 input[type="number"]:focus { outline: none; border-color: var(--ember); box-shadow: 0 0 0 3px rgba(232,132,58,0.12); }
 label.inline { margin: 0; text-transform: none; letter-spacing: 0; font-size: 12px; color: var(--paper-dim); }
-button.xs { padding: 3px 8px; font-size: 11px; }
 button.alt { background: var(--gold); }
 
 /* ---------- структура порциями ---------- */
@@ -454,6 +488,19 @@ button:disabled.xs { opacity: 0.7; }
   word-break: break-all;
 }
 .sp-authlink:hover { filter: brightness(1.08); }
+
+/* список прошлых работ */
+.runs { margin: 8px 0 2px; display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; }
+.runs-empty { font-size: 11px; color: var(--muted); padding: 6px 2px; }
+.run-item {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+}
+.run-item.cur { border-color: var(--ember); }
+.run-meta { flex: 1; min-width: 0; cursor: pointer; }
+.run-theme { font-size: 12px; color: var(--paper); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.run-sub { font-size: 10px; color: var(--muted); font-family: var(--font-mono); margin-top: 2px; }
+.run-item:hover { border-color: var(--line2); }
 .model-select { width: 100%; background: var(--ink); color: var(--paper); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font-family: inherit; font-size: 12px; }
 
 /* review-gate в сайдбаре */
@@ -487,7 +534,9 @@ button:disabled.xs { opacity: 0.7; }
 .ch-apply-note { font-size: 11px; color: var(--sage); padding: 0 12px 8px; line-height: 1.4; }
 
 /* ghost-превью следующего этапа */
-.ghost {
+/* превью следующего этапа. НЕ .ghost — конфликтовал с button.ghost
+   (display:flex/align:flex-start «текли» на все вторичные кнопки) */
+.preview {
   display: flex; gap: 12px; align-items: flex-start;
   padding: 13px 16px; margin-bottom: 16px; border-radius: 10px;
   border: 1px dashed var(--line2); background: rgba(255,255,255,0.015);

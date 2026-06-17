@@ -285,6 +285,43 @@ def get_state(thread_id: str):
             "state": _serialize(snap.values or {})}
 
 
+@app.get("/api/runs")
+def list_runs():
+    """Список всех прогонов (новелл) из чекпоинт-БД — чтобы продолжить
+    оборванную работу после рестарта/краша или скачать готовую."""
+    import sqlite3
+    db = os.environ.get("NARRATIVE_DB", "narrative_state.db")
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True,
+                               check_same_thread=False)
+        rows = [r[0] for r in conn.execute(
+            "SELECT thread_id FROM checkpoints GROUP BY thread_id "
+            "ORDER BY MAX(rowid) DESC LIMIT 100")]
+        conn.close()
+    except Exception:
+        rows = list(RUNS.keys())
+    out = []
+    for tid in rows:
+        try:
+            snap = _GRAPH_STEP.get_state(_config(tid))
+        except Exception:
+            continue
+        vals = snap.values or {}
+        if not vals.get("theme"):
+            continue  # пустой/мусорный чекпоинт — пропускаем
+        chs = vals.get("chapters") or []
+        run = RUNS.get(tid)
+        status = run.status if run else ("done" if not snap.next else "paused")
+        out.append({
+            "thread_id": tid,
+            "theme": str(vals.get("theme", ""))[:100],
+            "chapters": len(chs),
+            "written": sum(1 for c in chs if getattr(c, "dialogue", None)),
+            "status": status,
+        })
+    return {"runs": out}
+
+
 @app.patch("/api/runs/{thread_id}/state")
 def patch_state(thread_id: str, req: PatchReq):
     run = _get_run(thread_id)
@@ -316,14 +353,17 @@ def set_step(thread_id: str, req: StepReq):
     """Тумблер пошагового режима НА ЛЕТУ. Если выключили во время паузы —
     автоматически продолжаем (worker добежит до конца / след. паузы)."""
     run = _get_run(thread_id)
-    run.step_mode = req.enabled
     auto_continued = False
-    if not req.enabled and run.status == "paused" and not (
-            run.worker and run.worker.is_alive()):
-        run.worker = threading.Thread(
-            target=_run_worker, args=(run, None, None), daemon=True)
-        run.worker.start()
-        auto_continued = True
+    # под _LOCK: иначе TOCTOU между проверкой run.status/worker и стартом потока
+    # (воркер параллельно читает step_mode / пишет status) → 2 воркера разом.
+    with _LOCK:
+        run.step_mode = req.enabled
+        if not req.enabled and run.status == "paused" and not (
+                run.worker and run.worker.is_alive()):
+            run.worker = threading.Thread(
+                target=_run_worker, args=(run, None, None), daemon=True)
+            run.worker.start()
+            auto_continued = True
     return {"ok": True, "step_mode": run.step_mode, "resumed": auto_continued}
 
 

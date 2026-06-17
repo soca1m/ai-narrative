@@ -402,7 +402,10 @@ def write_chapter(state: State, ch: Chapter, idx: int,
         out = llm.structured(system, user, DialogueOut, temperature=0.7)
         ch.dialogue, ch.statics, ch.anims = out.script, out.statics, out.anims
     except Exception:
+        # фолбэк на прозу: чистим статики/анимации — иначе остались бы от
+        # прошлого (другого) текста главы и сбили бы художника/UI.
         ch.dialogue = llm.complete(system, user)
+        ch.statics, ch.anims = [], []
     ch.adult_scene = None  # адалт теперь внутри ch.dialogue, не вставкой
     # #4: адалт-сцена вышла короткой → один добор объёма (grok иногда мельчит)
     if is_adult and _too_short(ch.dialogue):
@@ -479,6 +482,7 @@ def patch_chapter(state: State, ch: Chapter, idx: int,
         ch.dialogue, ch.statics, ch.anims = out.script, out.statics, out.anims
     except Exception:
         ch.dialogue = llm.complete(system, user)
+        ch.statics, ch.anims = [], []  # не оставлять статики от прошлого текста
     ch.adult_scene = None
     return ch
 
@@ -637,10 +641,16 @@ def adult_node(state: State) -> dict:
     }
 
 
-def _finding_id(idx: int, fo) -> str:
-    """Стабильный id замечания: глава + block + хэш локатора (переживает раунды)."""
+def _finding_id(idx: int, rnd: int, fo) -> str:
+    """id замечания: глава + НОМЕР РЕВИЗИИ + block + хэш локатора.
+
+    round обязателен: без него решение (rejected/accepted) из прошлой ревизии
+    наследовалось новым finding с тем же locator → «скрывалась случайная правка».
+    Семантику «не поднимать отклонённое» несёт rejected_notes (по тексту), а не
+    наследование статуса.
+    """
     h = hashlib.sha1(f"{fo.block}|{fo.locator}".encode()).hexdigest()[:8]
-    return f"c{idx}-{fo.block}-{h}"
+    return f"c{idx}-r{rnd}-{fo.block}-{h}"
 
 
 def editor_node(state: State) -> dict:
@@ -684,9 +694,12 @@ def editor_node(state: State) -> dict:
         }
 
     decisions = state.get("finding_decisions") or {}
+    # номер текущей ревизии главы = сколько отчётов по ней уже есть
+    rnd = len([r for r in (state.get("editor_reports") or [])
+               if r.chapter_index == idx])
     findings: list[Finding] = []
     for fo in out.findings:
-        fid = _finding_id(idx, fo)
+        fid = _finding_id(idx, rnd, fo)
         d = decisions.get(fid, {})
         findings.append(Finding(
             id=fid, severity=fo.severity, block=fo.block,
