@@ -5,9 +5,16 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Optional, Type, TypeVar
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 from pydantic import BaseModel
 
 from .config import ProviderConfig
@@ -15,15 +22,111 @@ from .config import ProviderConfig
 T = TypeVar("T", bound=BaseModel)
 
 
+class LLMLimitError(Exception):
+    """Провайдер исчерпан: кончились кредиты/лимит/квота (не транзиентно).
+
+    Пайплайн ловит это и спрашивает нарративщика: ждать сброса или
+    переключиться на другого провайдера (OpenRouter ↔ подписка Claude).
+    """
+
+    def __init__(self, message: str, provider: str = "openrouter",
+                 reset_at: Optional[float] = None, kind: str = "limit"):
+        super().__init__(message)
+        self.provider = provider          # "openrouter" | "subscription"
+        self.reset_at = reset_at          # epoch сброса (если известно)
+        self.kind = kind                  # "credits" | "rate" | "limit"
+
+
+# Сколько раз повторяем транзиентные сбои (таймаут/сеть/5xx/rate) до сдачи.
+_MAX_TRIES = 4
+_BACKOFF_BASE = 1.5
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    """Выудить Retry-After/reset из заголовков ответа провайдера."""
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None) or {}
+    for key in ("retry-after", "Retry-After",
+                "x-ratelimit-reset-requests", "x-ratelimit-reset"):
+        val = headers.get(key) if hasattr(headers, "get") else None
+        if not val:
+            continue
+        try:
+            secs = float(val)
+            return secs if secs < 1e6 else None
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _ra(exc: Exception) -> Optional[float]:
+    """reset_at = now + Retry-After (если провайдер прислал заголовок)."""
+    secs = _retry_after_seconds(exc)
+    return (time.time() + secs) if secs else None
+
+
+def _sleep(attempt: int, exc: Exception) -> None:
+    """Backoff между ретраями: Retry-After, иначе экспонента с потолком."""
+    hinted = _retry_after_seconds(exc)
+    delay = hinted if (hinted and hinted <= 30) else _BACKOFF_BASE ** attempt
+    time.sleep(min(delay, 30.0))
+
+
+def _is_exhausted(exc: Exception) -> bool:
+    """429/402 с признаком кончившихся кредитов/квоты (не временный rate)."""
+    msg = str(exc).lower()
+    status = getattr(exc, "status_code", None)
+    if status == 402:  # OpenRouter: нет кредитов
+        return True
+    return any(s in msg for s in (
+        "insufficient", "quota", "credit", "out of", "payment required",
+        "exceeded your", "usage limit", "monthly limit",
+    ))
+
+
 class LLM:
     def __init__(self, cfg: ProviderConfig):
         self.cfg = cfg
         self._client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
 
+    def _create(self, **kwargs):
+        """chat.completions.create с ретраями и классификацией сбоев.
+
+        Транзиент (таймаут/сеть/5xx/временный rate) → повтор с backoff.
+        Исчерпание кредитов/квоты → LLMLimitError (пайплайн спросит юзера).
+        Стриминг (stream=True) тоже идёт сюда: ретраится только установка
+        соединения до первого чанка.
+        """
+        last: Optional[Exception] = None
+        for attempt in range(_MAX_TRIES):
+            try:
+                return self._client.chat.completions.create(**kwargs)
+            except RateLimitError as exc:
+                last = exc
+                if _is_exhausted(exc):
+                    raise LLMLimitError(
+                        str(exc)[:200], provider="openrouter",
+                        reset_at=_ra(exc), kind="credits") from exc
+                _sleep(attempt, exc)  # временный rate → ждём и повторяем
+            except (APITimeoutError, APIConnectionError,
+                    InternalServerError) as exc:
+                last = exc
+                _sleep(attempt, exc)
+            except Exception as exc:  # noqa: BLE001
+                if _is_exhausted(exc):
+                    raise LLMLimitError(str(exc)[:200], provider="openrouter",
+                                        kind="credits") from exc
+                raise
+        # ретраи исчерпаны — если это был rate, трактуем как лимит
+        if isinstance(last, RateLimitError):
+            raise LLMLimitError(str(last)[:200], provider="openrouter",
+                                reset_at=_ra(last), kind="rate") from last
+        raise last if last else RuntimeError("LLM: неизвестный сбой")
+
     def complete(self, system: str, user: str,
                  temperature: Optional[float] = None) -> str:
         """Обычная генерация текста (используют все боты кроме редактора)."""
-        resp = self._client.chat.completions.create(
+        resp = self._create(
             model=self.cfg.model,
             temperature=self.cfg.temperature if temperature is None else temperature,
             messages=[
@@ -37,7 +140,7 @@ class LLM:
     def chat(self, system: str, messages: list[dict],
              temperature: Optional[float] = None) -> str:
         """Многоходовый диалог (чат с ИИ-редактором в UI)."""
-        resp = self._client.chat.completions.create(
+        resp = self._create(
             model=self.cfg.model,
             temperature=self.cfg.temperature if temperature is None else temperature,
             messages=[{"role": "system", "content": system}, *messages],
@@ -60,7 +163,7 @@ class LLM:
           2. _extract_json — снимает markdown-ограждение, если осталось;
           3. model_validate_json — финальная валидация.
         """
-        resp = self._client.chat.completions.create(
+        resp = self._create(
             model=self.cfg.model,
             temperature=temperature,
             response_format={

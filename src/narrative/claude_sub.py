@@ -11,16 +11,46 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from typing import Optional, Type, TypeVar
 
 from pydantic import BaseModel
 
-from .llm import _extract_json
+from .llm import LLMLimitError, _extract_json
 
 T = TypeVar("T", bound=BaseModel)
 
 # Дефолтная модель подписки. Слаги SDK: sonnet / opus / haiku.
 DEFAULT_SUB_MODEL = "sonnet"
+
+# Признаки исчерпания лимита подписки в тексте ошибки/ответа SDK.
+_LIMIT_MARKERS = (
+    "usage limit", "rate limit", "limit reached", "limit will reset",
+    "quota", "out of", "too many requests", "429",
+    "лимит", "превышен", "исчерпан",
+)
+
+
+def _sub_limit_error(text: str) -> Optional[LLMLimitError]:
+    """Если текст похож на лимит подписки → LLMLimitError (иначе None).
+
+    Пытаемся выудить время сброса: epoch-таймстамп или «through HH:MM»/«X hours».
+    """
+    low = (text or "").lower()
+    if not any(m in low for m in _LIMIT_MARKERS):
+        return None
+    reset_at: Optional[float] = None
+    m = re.search(r"\b(1[6-9]\d{8}|20\d{8})\b", text or "")  # epoch (сек)
+    if m:
+        reset_at = float(m.group(1))
+    else:
+        h = re.search(r"(\d+)\s*hour", low)
+        if h:
+            reset_at = time.time() + int(h.group(1)) * 3600
+    return LLMLimitError(text[:200] or "Claude subscription limit",
+                         provider="subscription", reset_at=reset_at,
+                         kind="limit")
 
 
 class ClaudeSubLLM:
@@ -57,7 +87,18 @@ class ClaudeSubLLM:
 
     def _run(self, system: str, prompt: str) -> str:
         # uvicorn-воркеры — обычные потоки без event loop → asyncio.run ок.
-        return asyncio.run(self._aquery(system, prompt))
+        try:
+            out = asyncio.run(self._aquery(system, prompt))
+        except Exception as exc:  # noqa: BLE001
+            limit = _sub_limit_error(str(exc))
+            if limit:
+                raise limit from exc
+            raise
+        # SDK иногда не бросает, а возвращает текст «лимит исчерпан»
+        limit = _sub_limit_error(out) if out and len(out) < 400 else None
+        if limit:
+            raise limit
+        return out
 
     # --- интерфейс LLM ---
     def complete(self, system: str, user: str,

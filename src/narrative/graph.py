@@ -146,8 +146,8 @@ def sqlite_saver(path: str | None = None) -> SqliteSaver:
 
 # Стадии, после которых можно вставать на паузу (step-mode для ручных правок).
 STAGE_NODES = [
-    "logline", "synopsis", "characters", "chapter_count", "structure",
-    "structure_editor", "dialogue", "editor", "translation",
+    "logline", "synopsis", "characters", "locations", "chapter_count",
+    "structure", "structure_editor", "dialogue", "editor", "translation",
 ]
 
 
@@ -158,6 +158,7 @@ def build_graph(checkpointer=None, interrupt_after=None):
     g.add_node("logline", nodes.logline_node)
     g.add_node("synopsis", nodes.synopsis_node)
     g.add_node("characters", nodes.characters_node)
+    g.add_node("locations", nodes.locations_node)
     g.add_node("chapter_count", nodes.chapter_count_node)
     g.add_node("structure", nodes.structure_node)
     g.add_node("structure_editor", nodes.structure_editor_node)
@@ -175,8 +176,9 @@ def build_graph(checkpointer=None, interrupt_after=None):
     g.add_edge(START, "logline")
     g.add_edge("logline", "synopsis")
     g.add_edge("synopsis", "characters")
-    # после персонажей — предложение числа глав (пауза на апрув), затем структура
-    g.add_edge("characters", "chapter_count")
+    # персонажи → локации (отдельный бот) → число глав → структура
+    g.add_edge("characters", "locations")
+    g.add_edge("locations", "chapter_count")
     g.add_edge("chapter_count", "structure")
     # структура пишется сразу на target_chapters → редактор структуры (#2)
     g.add_edge("structure", "structure_editor")

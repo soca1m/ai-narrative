@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 from narrative import nodes
 from narrative.graph import STAGE_NODES, build_graph, sqlite_saver
+from narrative.llm import LLMLimitError
 from narrative.routing import apply_decisions
 from narrative.state import Chapter, JudgeOut
 
@@ -59,6 +60,7 @@ NODE_FUNCS = {
     "logline": nodes.logline_node,
     "synopsis": nodes.synopsis_node,
     "characters": nodes.characters_node,
+    "locations": nodes.locations_node,
     "structure": nodes.structure_node,
     "dialogue": nodes.dialogue_node,
     "adult": nodes.adult_node,
@@ -69,8 +71,9 @@ NODE_FUNCS = {
 # Откат: какой узел «проиграть как предыдущий», чтобы next встал на нужный этап,
 # и какие (не-reducer) поля очистить.
 ROLLBACK = {
-    "synopsis":   ("logline",    ["synopsis", "characters", "chapters", "chapter_idx", "structure_done"]),
-    "characters": ("synopsis",   ["characters", "chapters", "chapter_idx", "structure_done"]),
+    "synopsis":   ("logline",    ["synopsis", "characters", "locations", "chapters", "chapter_idx", "structure_done"]),
+    "characters": ("synopsis",   ["characters", "locations", "chapters", "chapter_idx", "structure_done"]),
+    "locations":  ("characters", ["locations", "chapters", "chapter_idx", "structure_done"]),
     "structure":  ("characters", ["chapters", "chapter_idx", "structure_done"]),
     "dialogue":   ("structure",  ["chapter_idx"]),  # перезапуск написания глав с 0
 }
@@ -85,6 +88,7 @@ class Run:
     printed: int = 0
     worker: Optional[threading.Thread] = None
     error: str = ""  # текст последней ошибки воркера (для UI)
+    limit: Optional[dict] = None  # инфо об исчерпании лимита (#5): баннер выбора
 
 
 RUNS: dict[str, Run] = {}
@@ -134,6 +138,12 @@ def _bg_op(run: Run, fn) -> dict:
             fn()
             run.status = prev
             run.events.put({"type": "status", "status": prev})
+        except LLMLimitError as exc:  # #5: лимит → баннер выбора, прогресс цел
+            run.limit = {"provider": exc.provider, "reset_at": exc.reset_at,
+                         "kind": exc.kind, "message": str(exc)[:200]}
+            run.status = "limit"
+            run.events.put({"type": "status", "status": "limit",
+                            "limit": run.limit})
         except Exception as exc:  # noqa: BLE001
             run.error = f"Операция не удалась (LLM/провайдер): {str(exc)[:200]}"
             run.status = prev
@@ -194,6 +204,16 @@ def _run_worker(run: Run, _graph_unused, stream_input):
                                 "next": list(snap.next)})
                 return
             inp = None  # авто-режим → продолжаем со следующей стадии
+    except LLMLimitError as exc:  # #5: лимит провайдера исчерпан → спросить юзера
+        limit = {"provider": exc.provider, "reset_at": exc.reset_at,
+                 "kind": exc.kind, "message": str(exc)[:200]}
+        run.limit = limit
+        run.status = "limit"
+        try:
+            _patch(run.thread_id, run, {"limit_info": limit})
+        except Exception:  # noqa: BLE001
+            pass
+        run.events.put({"type": "status", "status": "limit", "limit": limit})
     except Exception as exc:  # noqa: BLE001
         run.status = "error"
         run.error = str(exc)
@@ -281,7 +301,7 @@ def get_state(thread_id: str):
     run = _get_run(thread_id)
     snap = _graph(run).get_state(_config(thread_id))
     return {"status": run.status, "next": list(snap.next),
-            "error": run.error,
+            "error": run.error, "limit": run.limit,
             "state": _serialize(snap.values or {})}
 
 
@@ -338,10 +358,67 @@ def patch_state(thread_id: str, req: PatchReq):
 def resume_run(thread_id: str):
     run = _get_run(thread_id)
     _busy(run)
+    run.limit = None  # снимаем баннер лимита при ресюме
     run.worker = threading.Thread(
         target=_run_worker, args=(run, None, None), daemon=True)
     run.worker.start()
     return {"ok": True}
+
+
+# ---------- #5: провайдер по этапам + разрешение лимита ----------
+
+_VALID_STAGES = set(STAGE_NODES) | {"locations", "chat"}
+
+
+class StageProviderReq(BaseModel):
+    stage: str                  # этап из STAGE_NODES (или "all")
+    provider: str               # "subscription" | "openrouter" | "default"
+
+
+@app.post("/api/runs/{thread_id}/stage_provider")
+def set_stage_provider(thread_id: str, req: StageProviderReq):
+    """Выбор провайдера (подписка/OpenRouter) для конкретного этапа (#5)."""
+    run = _get_run(thread_id)
+    if req.provider not in ("subscription", "openrouter", "default"):
+        raise HTTPException(400, "bad provider")
+    st = _state(thread_id)
+    sp = dict(st.get("stage_providers") or {})
+    stages = list(_VALID_STAGES) if req.stage == "all" else [req.stage]
+    for s in stages:
+        if req.provider == "default":
+            sp.pop(s, None)
+        else:
+            sp[s] = req.provider
+    _patch(thread_id, run, {"stage_providers": sp})
+    return {"ok": True, "stage_providers": sp}
+
+
+class LimitResolveReq(BaseModel):
+    action: str                 # "switch" (→OpenRouter) | "wait" | "subscription"
+
+
+@app.post("/api/runs/{thread_id}/limit/resolve")
+def resolve_limit(thread_id: str, req: LimitResolveReq):
+    """Решение нарративщика по исчерпанному лимиту (#5).
+
+    switch — весь ран на OpenRouter и продолжить; subscription — снова на
+    подписку (после сброса) и продолжить; wait — просто снять баннер.
+    """
+    run = _get_run(thread_id)
+    _busy(run)
+    if req.action == "switch":
+        _patch(thread_id, run, {"force_openrouter": True, "limit_info": None})
+    elif req.action == "subscription":
+        _patch(thread_id, run, {"force_openrouter": False, "limit_info": None})
+    elif req.action != "wait":
+        raise HTTPException(400, "bad action")
+    run.limit = None
+    if req.action in ("switch", "subscription"):
+        run.worker = threading.Thread(
+            target=_run_worker, args=(run, None, None), daemon=True)
+        run.worker.start()
+        return {"ok": True, "resumed": True}
+    return {"ok": True, "resumed": False}
 
 
 class StepReq(BaseModel):
@@ -549,6 +626,71 @@ def set_chapter_count(thread_id: str, req: CountReq):
     return resume_run(thread_id)
 
 
+@app.post("/api/runs/{thread_id}/restructure")
+def restructure(thread_id: str, req: CountReq):
+    """#7: пересобрать структуру под НОВОЕ число глав (растянуть/сжать сюжет,
+    не обрезать). Регенерит поглавный план — написанные тексты сбрасываются."""
+    run = _get_run(thread_id)
+    _busy(run)
+    n = max(2, min(int(req.count), 30))
+
+    def _op():
+        st = _state(thread_id)
+        st["target_chapters"] = n
+        result = nodes.structure_node(st)  # учитывает текущий план как опору
+        _patch(thread_id, run, result)
+        run.events.put({"type": "edited", "keys": list(result.keys())})
+
+    return _bg_op(run, _op)
+
+
+class AddChapterReq(BaseModel):
+    after_idx: int = -1   # вставить ПОСЛЕ этого индекса; -1 → в начало
+
+
+@app.post("/api/runs/{thread_id}/chapter/add")
+def add_chapter(thread_id: str, req: AddChapterReq):
+    """#7: добавить ОДНУ главу на лету (ИИ генерит план, связывает соседей)."""
+    run = _get_run(thread_id)
+    _busy(run)
+
+    def _op():
+        st = _state(thread_id)
+        chapters = list(st.get("chapters") or [])
+        after = max(-1, min(req.after_idx, len(chapters) - 1))
+        new_ch = nodes.gen_inserted_chapter(st, after)
+        chapters.insert(after + 1, new_ch)
+        for i, ch in enumerate(chapters):
+            ch.index = i
+        _patch(thread_id, run, {"chapters": chapters})
+        run.events.put({"type": "edited", "keys": ["chapters"]})
+
+    return _bg_op(run, _op)
+
+
+@app.delete("/api/runs/{thread_id}/chapter/{idx}")
+def delete_chapter(thread_id: str, idx: int):
+    """#7: удалить главу и переиндексировать остальные."""
+    run = _get_run(thread_id)
+    _busy(run)
+    st = _state(thread_id)
+    chapters = list(st.get("chapters") or [])
+    if idx < 0 or idx >= len(chapters):
+        raise HTTPException(400, "bad chapter index")
+    if len(chapters) <= 1:
+        raise HTTPException(400, "нельзя удалить последнюю главу")
+    chapters.pop(idx)
+    for i, ch in enumerate(chapters):
+        ch.index = i
+    cur = st.get("chapter_idx", 0)
+    patch = {"chapters": chapters}
+    if cur >= len(chapters):
+        patch["chapter_idx"] = len(chapters) - 1
+    _patch(thread_id, run, patch)
+    run.events.put({"type": "edited", "keys": ["chapters"]})
+    return {"ok": True, "chapters": len(chapters)}
+
+
 # ---------- решения по findings редактора ----------
 
 def _find_finding(st: dict, fid: str):
@@ -629,28 +771,41 @@ def chat(thread_id: str, req: ChatReq):
     """
     _get_run(thread_id)
     st = _state(thread_id)
+    chs = list(st.get("chapters") or [])
 
     ctx_parts = [f"Карточки персонажей:\n{st.get('characters', '')}"]
-    if req.chapter_idx is not None:
-        chs = list(st.get("chapters") or [])
-        if 0 <= req.chapter_idx < len(chs):
-            ch = chs[req.chapter_idx]
-            ctx_parts.append(
-                f"Глава {req.chapter_idx + 1} «{ch.title}»\n"
-                f"План:\n{ch.plan}\n\nТекст:\n{ch.dialogue or '(не написан)'}"
+    if st.get("locations"):
+        ctx_parts.append(f"Локации:\n{st.get('locations')}")
+    if st.get("synopsis"):
+        ctx_parts.append(f"Синопсис:\n{st.get('synopsis')}")
+
+    # #4: общий обзор всех глав — чтобы чат понимал вопросы про соседние/
+    # следующие главы и другие этапы, а не падал/терялся вне одной главы.
+    if chs:
+        overview = "\n".join(
+            f"{c.index + 1}. {c.title}"
+            f"{' [адалт]' if c.is_adult_point else ''}"
+            f"{' — написана' if c.dialogue else ' — не написана'}"
+            for c in chs
+        )
+        ctx_parts.append(f"Все главы (обзор):\n{overview}")
+
+    if req.chapter_idx is not None and 0 <= req.chapter_idx < len(chs):
+        ch = chs[req.chapter_idx]
+        ctx_parts.append(
+            f"ТЕКУЩАЯ глава {req.chapter_idx + 1} «{ch.title}»\n"
+            f"План:\n{ch.plan}\n\nТекст:\n{ch.dialogue or '(не написан)'}"
+        )
+        last = _last_report(st, req.chapter_idx)
+        if last and last.findings:
+            joined = "\n".join(
+                f"- [{f.severity}/{f.block}] {f.locator}: {f.problem}"
+                f"{' (ОТКЛОНЕНО нарративщиком)' if f.status == 'rejected' else ''}"
+                for f in last.findings
             )
-            # все замечания последнего отчёта этой главы — чат привязан к ревизии
-            last = _last_report(st, req.chapter_idx)
-            if last and last.findings:
-                joined = "\n".join(
-                    f"- [{f.severity}/{f.block}] {f.locator}: {f.problem}"
-                    f"{' (ОТКЛОНЕНО нарративщиком)' if f.status == 'rejected' else ''}"
-                    for f in last.findings
-                )
-                ctx_parts.append(
-                    "Замечания редактора по этой главе (текущая ревизия):\n"
-                    + joined
-                )
+            ctx_parts.append(
+                "Замечания редактора по этой главе (текущая ревизия):\n" + joined
+            )
     if req.finding_id:
         f = _find_finding(st, req.finding_id)
         if f is not None:
@@ -661,7 +816,8 @@ def chat(thread_id: str, req: ChatReq):
 
     system = (
         "Ты — опытный редактор визуальных новелл 18+, собеседник нарративщика. "
-        "Обсуждай правки по делу: предлагай конкретные варианты формулировок и "
+        "Обсуждай по делу любой этап работы: главы, синопсис, персонажей, "
+        "локации, структуру. Предлагай конкретные варианты формулировок и "
         "фиксов, объясняй коротко. Не переписывай главу целиком без просьбы. "
         "Отвечай на языке нарративщика." + NO_MARKDOWN
         + "\n\nКОНТЕКСТ:\n" + "\n\n".join(ctx_parts)
@@ -672,10 +828,18 @@ def chat(thread_id: str, req: ChatReq):
         if m.get("role") in ("user", "assistant")
     ]
     try:
-        reply = nodes._editor().chat(system, history)
+        reply = nodes._editor(st, "chat").chat(system, history)
+    except LLMLimitError as exc:  # #5: лимит → 429 + инфо для баннера
+        raise HTTPException(429, _limit_detail(exc))
     except Exception as exc:  # noqa: BLE001 — LLM/провайдер недоступен
         raise HTTPException(502, f"чат недоступен (LLM): {str(exc)[:160]}")
     return {"reply": reply}
+
+
+def _limit_detail(exc: LLMLimitError) -> dict:
+    return {"error": "limit", "provider": exc.provider,
+            "reset_at": exc.reset_at, "kind": exc.kind,
+            "message": str(exc)[:200]}
 
 
 @app.post("/api/runs/{thread_id}/chapter/{idx}/apply_chat")
@@ -708,9 +872,11 @@ def apply_chat(thread_id: str, idx: int, req: ChatReq):
         f"ОБСУЖДЕНИЕ:\n{convo}\n\nТЕКУЩАЯ ГЛАВА {idx + 1} «{ch.title}»:\n"
         f"{ch.dialogue or ch.plan}\n\nПримени решения обсуждения к главе."
     )
-    llm = nodes._adult() if ch.is_adult_point else nodes._structural()
+    llm = nodes._adult() if ch.is_adult_point else nodes._structural(st, "dialogue")
     try:
         out = llm.structured(system, user, ChatApplyOut, temperature=0.6)
+    except LLMLimitError as exc:
+        raise HTTPException(429, _limit_detail(exc))
     except Exception as exc:
         raise HTTPException(502, f"не удалось применить (LLM): {str(exc)[:160]}")
     if out.changed and out.script.strip():

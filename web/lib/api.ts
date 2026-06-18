@@ -47,6 +47,10 @@ export type NarrativeState = {
   logline?: string;
   synopsis?: string;
   characters?: string;
+  locations?: string;
+  stage_providers?: Record<string, string>;
+  force_openrouter?: boolean;
+  limit_info?: LimitInfo | null;
   chapters?: Chapter[];
   chapter_idx?: number;
   phase?: string;
@@ -94,9 +98,14 @@ export const listRuns = (): Promise<{ runs: RunSummary[] }> =>
     return r.json();
   });
 
+export type LimitInfo = {
+  provider: string; reset_at?: number | null; kind?: string; message?: string;
+};
+
 export async function getState(
   threadId: string,
-): Promise<{ status: string; next: string[]; error?: string; state: NarrativeState }> {
+): Promise<{ status: string; next: string[]; error?: string;
+  limit?: LimitInfo | null; state: NarrativeState }> {
   const r = await fetch(`${API_BASE}/api/runs/${threadId}/state`);
   if (!r.ok) throw new Error(`state failed: ${r.status}`);
   return r.json();
@@ -133,6 +142,24 @@ export const syncPlan = (id: string, idx: number) =>
 
 export const setChapterCount = (id: string, count: number) =>
   jpost(`/api/runs/${id}/chapter_count`, { count });
+
+// #7: пересобрать структуру под новое число глав (растянуть/сжать)
+export const restructure = (id: string, count: number) =>
+  jpost(`/api/runs/${id}/restructure`, { count });
+// #7: добавить главу после индекса (-1 → в начало), ИИ генерит план
+export const addChapter = (id: string, after_idx: number) =>
+  jpost(`/api/runs/${id}/chapter/add`, { after_idx });
+// #7: удалить главу
+export const deleteChapter = (id: string, idx: number) =>
+  fetch(`${API_BASE}/api/runs/${id}/chapter/${idx}`, { method: "DELETE" })
+    .then((r) => { if (!r.ok) throw new Error(`del failed: ${r.status}`); return r.json(); });
+
+// #5: провайдер (подписка/OpenRouter) для этапа ("all" → все)
+export const setStageProvider = (id: string, stage: string, provider: string) =>
+  jpost(`/api/runs/${id}/stage_provider`, { stage, provider });
+// #5: решение по исчерпанному лимиту: switch | wait | subscription
+export const resolveLimit = (id: string, action: "switch" | "wait" | "subscription") =>
+  jpost(`/api/runs/${id}/limit/resolve`, { action });
 export const setStepMode = (id: string, enabled: boolean) =>
   jpost(`/api/runs/${id}/step`, { enabled });
 

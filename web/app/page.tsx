@@ -17,10 +17,16 @@ import {
   FindingStatus,
   ClaudeStatus,
   NarrativeState,
+  LimitInfo,
   chatWithEditor,
   applyChatToChapter,
   applyRevision,
   exportProject,
+  restructure,
+  addChapter,
+  deleteChapter,
+  setStageProvider,
+  resolveLimit,
   RunSummary,
   listRuns,
   claudeStatus,
@@ -49,12 +55,13 @@ const STAGES: [string, string, string][] = [
   ["logline", "Логлайн", "01"],
   ["synopsis", "Синопсис", "02"],
   ["characters", "Персонажи", "03"],
-  ["chapter_count", "Объём", "04"],
-  ["structure", "Структура", "05"],
-  ["structure_editor", "Ред. структуры", "06"],
-  ["dialogue", "Диалоги + Адалт", "07"],
-  ["editor", "Редактор", "08"],
-  ["translation", "Перевод", "09"],
+  ["locations", "Локации", "04"],
+  ["chapter_count", "Объём", "05"],
+  ["structure", "Структура", "06"],
+  ["structure_editor", "Ред. структуры", "07"],
+  ["dialogue", "Диалоги + Адалт", "08"],
+  ["editor", "Редактор", "09"],
+  ["translation", "Перевод", "10"],
 ];
 
 // что сейчас сгенерируется — для ghost-превью следующего этапа
@@ -62,6 +69,7 @@ const STAGE_DESC: Record<string, string> = {
   logline: "Бот придумает несколько вариантов логлайна — выберешь один.",
   synopsis: "Развёрнутый синопсис на основе выбранного логлайна.",
   characters: "Карточки персонажей: внешность, характер, мотивации (канон).",
+  locations: "Карточки локаций: места действия, атмосфера, теги для художника.",
   chapter_count: "ИИ оценит и предложит оптимальное число глав.",
   structure: "Поглавный план: что в каждой главе + где адалт-точки.",
   structure_editor: "Редактор проверит и сам починит план до написания.",
@@ -201,6 +209,7 @@ export default function Page() {
   const [status, setStatus] = useState("idle");
   const [next, setNext] = useState<string[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [limit, setLimit] = useState<LimitInfo | null>(null);
   const [applyingRev, setApplyingRev] = useState(false);
   const [st, setSt] = useState<NarrativeState>({});
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -209,6 +218,7 @@ export default function Page() {
   const [dirty, setDirty] = useState<Set<string>>(new Set());
   const [saved, setSaved] = useState<string | null>(null);
   const [countInput, setCountInput] = useState<number | "">("");
+  const [reCount, setReCount] = useState<number | "">("");  // #7 пересборка
 
   // список прошлых работ (продолжить оборванную / скачать)
   const [runs, setRuns] = useState<RunSummary[]>([]);
@@ -231,7 +241,7 @@ export default function Page() {
   function syncDrafts(s: NarrativeState) {
     setDrafts((prev) => {
       const d = { ...prev };
-      for (const k of ["synopsis", "characters"] as const) {
+      for (const k of ["synopsis", "characters", "locations"] as const) {
         if (dirty.has(k)) continue;
         // строка из state → в черновик; пусто/None (после отката) → очищаем,
         // иначе блок не исчезает (EditableCard скрывается при пустом value).
@@ -260,6 +270,7 @@ export default function Page() {
         setStatus(r.status);
         setNext(r.next);
         setErr(r.error || null);
+        setLimit(r.limit || null);
         setSt(r.state);
         syncDrafts(r.state);
         if (r.status === "running" || r.status === "idle")
@@ -284,6 +295,34 @@ export default function Page() {
 
   function refresh() { if (threadId) poll(threadId); }
 
+  // #7: пересобрать структуру под новое число глав / добавить / удалить главу
+  async function onRestructure() {
+    if (!threadId || !reCount) return;
+    if (!confirm(`Пересобрать структуру под ${reCount} глав? Сюжет растянется/`
+      + `сожмётся, написанные тексты глав сбросятся.`)) return;
+    await restructure(threadId, +reCount);
+    setReCount(""); setStatus("running"); poll(threadId);
+  }
+  async function onAddChapter(after: number) {
+    if (!threadId) return;
+    await addChapter(threadId, after);
+    setStatus("running"); poll(threadId);
+  }
+  async function onDeleteChapter(idx: number) {
+    if (!threadId) return;
+    if (!confirm(`Удалить главу ${idx + 1}?`)) return;
+    await deleteChapter(threadId, idx); refresh();
+  }
+
+  // #5: решение по исчерпанному лимиту провайдера
+  async function onLimit(action: "switch" | "wait" | "subscription") {
+    if (!threadId) return;
+    try { await resolveLimit(threadId, action); } catch {}
+    setLimit(null);
+    if (action !== "wait") setStatus("running");
+    poll(threadId);
+  }
+
   function edit(key: string, val: string) {
     setDrafts((d) => ({ ...d, [key]: val }));
     setDirty((s) => new Set(s).add(key));
@@ -301,6 +340,7 @@ export default function Page() {
     logline: !!st.loglines?.length,
     synopsis: !!st.synopsis,
     characters: !!st.characters,
+    locations: !!st.locations,
     chapter_count: (st.suggested_chapters ?? 0) > 0 || (st.target_chapters ?? 0) > 0,
     structure: !!st.chapters?.length,
     structure_editor: Array.isArray(st.structure_fixes),
@@ -321,6 +361,8 @@ export default function Page() {
     ? "dialogue"
     : has.structure
     ? "structure"
+    : has.locations
+    ? "locations"
     : has.characters
     ? "characters"
     : has.synopsis
@@ -459,6 +501,32 @@ export default function Page() {
                   : <button className="wide ghost" onClick={() => setErr(null)}>Закрыть</button>}
               </div>
             )}
+            {limit && (
+              <div className="limitbox">
+                <div className="errt">
+                  <AlertTriangle size={15} /> Лимит{" "}
+                  {limit.provider === "subscription" ? "подписки Claude" : "OpenRouter"}{" "}
+                  исчерпан
+                </div>
+                <div className="errm">
+                  {limit.message || "Провайдер временно недоступен по лимиту."}
+                  {limit.reset_at
+                    ? <><br />Сброс: {new Date(limit.reset_at * 1000).toLocaleString()}</>
+                    : <><br />Остаток/время сброса провайдер не сообщил.</>}
+                </div>
+                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                  <button className="small" onClick={() => onLimit("switch")}>
+                    <RefreshCw size={14} /> Перейти на OpenRouter
+                  </button>
+                  <button className="small secondary" onClick={() => onLimit("subscription")}>
+                    <RotateCw size={14} /> Снова подписка
+                  </button>
+                  <button className="small ghost" onClick={() => onLimit("wait")}>
+                    Подождать (скрыть)
+                  </button>
+                </div>
+              </div>
+            )}
             {busy && (
               <div className="working">
                 <Loader2 size={15} className="spin" />
@@ -531,6 +599,14 @@ export default function Page() {
                 </button>
               </div>
             )}
+
+            <StageProviderPanel
+              threadId={threadId}
+              providers={st.stage_providers ?? {}}
+              forceOR={!!st.force_openrouter}
+              disabled={busy}
+              onChanged={refresh}
+            />
 
             <h2 className="section">Лента событий</h2>
             <div className="feed">
@@ -629,8 +705,29 @@ export default function Page() {
               <Stat v={openCrit} k="критич." cls="crit" />
             </div>
 
+            {/* #7: управление числом глав — пересобрать / добавить */}
+            {(st.chapters?.length ?? 0) > 0 && !projectDone && (
+              <div className="chapctl">
+                <span className="cc-lbl">Глав: <b>{st.chapters!.length}</b></span>
+                <input type="number" min={2} max={30} placeholder="новое число"
+                  value={reCount}
+                  onChange={(e) => setReCount(e.target.value === "" ? "" : Math.max(2, +e.target.value))} />
+                <button className="small" disabled={busy || !reCount}
+                  onClick={onRestructure} title="Пересобрать сюжет под новое число глав">
+                  <RefreshCw size={14} /> Пересобрать
+                </button>
+                <button className="small secondary" disabled={busy}
+                  onClick={() => onAddChapter((st.chapters?.length ?? 1) - 1)}
+                  title="ИИ допишет главу в конец">
+                  <Plus size={14} /> Глава в конец
+                </button>
+              </div>
+            )}
+
             {/* Порядок убывания: свежие результаты сверху (главы → персонажи → синопсис → логлайн) */}
             <Chapters
+              onAddChapter={onAddChapter}
+              onDeleteChapter={onDeleteChapter}
               threadId={threadId}
               phase={st.phase}
               activeIdx={curIdx}
@@ -661,6 +758,15 @@ export default function Page() {
               onRollback={currentStage === "characters" ? () => guard(async () => { if (threadId && confirm("Откатить этап персонажей: удалить карточки и сгенерировать заново?")) { await rollback(threadId, "characters"); refresh(); } }) : undefined}
             />
 
+            {/* Локации */}
+            <EditableCard
+              title="Локации · места действия (канон)" bot="04" rows={10} valKey="locations" busy={busy}
+              value={drafts.locations ?? ""} dirty={dirty.has("locations")} saved={saved === "locations"}
+              onChange={(v) => edit("locations", v)} onSave={() => save("locations")}
+              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "locations", fb); refresh(); } })}
+              onRollback={currentStage === "locations" ? () => guard(async () => { if (threadId && confirm("Откатить этап локаций: удалить карточки локаций и сгенерировать заново?")) { await rollback(threadId, "locations"); refresh(); } }) : undefined}
+            />
+
             {/* Синопсис */}
             <EditableCard
               title="Синопсис" bot="02" rows={10} valKey="synopsis" busy={busy}
@@ -681,6 +787,63 @@ export default function Page() {
           </>
         )}
       </main>
+    </div>
+  );
+}
+
+// #5: выбор провайдера (подписка Claude / OpenRouter) на каждый этап
+function StageProviderPanel({
+  threadId, providers, forceOR, onChanged, disabled,
+}: {
+  threadId: string; providers: Record<string, string>; forceOR: boolean;
+  onChanged: () => void; disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const ROWS: [string, string][] = [
+    ["logline", "Логлайн"], ["synopsis", "Синопсис"], ["characters", "Персонажи"],
+    ["locations", "Локации"], ["chapter_count", "Объём"], ["structure", "Структура"],
+    ["structure_editor", "Ред. структуры"], ["dialogue", "Диалоги/Адалт"],
+    ["editor", "Редактор"], ["translation", "Перевод"], ["chat", "Чат"],
+  ];
+  async function set(stage: string, v: string) {
+    await setStageProvider(threadId, stage, v); onChanged();
+  }
+  return (
+    <div className="subpanel">
+      <div className="sp-head" style={{ cursor: "pointer" }} onClick={() => setOpen((o) => !o)}>
+        <span>Провайдер по этапам</span>
+        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+      </div>
+      {forceOR && <div className="sp-hint">Сейчас весь ран на OpenRouter (фолбэк лимита).</div>}
+      {open && (
+        <div className="provrows">
+          <div className="sp-hint">
+            Подписка Claude (дёшево) или OpenRouter (платно) — на каждый этап.
+            «по умолч.» = глобальный тумблер выше.
+          </div>
+          <div className="provrow allrow">
+            <span>Все этапы</span>
+            <select disabled={disabled} value=""
+              onChange={(e) => e.target.value && set("all", e.target.value)}>
+              <option value="">задать все…</option>
+              <option value="subscription">подписка</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="default">по умолч.</option>
+            </select>
+          </div>
+          {ROWS.map(([k, label]) => (
+            <div className="provrow" key={k}>
+              <span>{label}</span>
+              <select disabled={disabled} value={providers[k] || "default"}
+                onChange={(e) => set(k, e.target.value)}>
+                <option value="default">по умолч.</option>
+                <option value="subscription">подписка</option>
+                <option value="openrouter">OpenRouter</option>
+              </select>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -780,6 +943,8 @@ function Chapters(props: {
   onDecide: (fid: string, body: { status?: FindingStatus; comment?: string; judge?: boolean }) => Promise<void>;
   onAdaptAdult: (i: number) => Promise<void>;
   onSkipAdult: (i: number) => Promise<void>;
+  onAddChapter: (after: number) => Promise<void>;
+  onDeleteChapter: (idx: number) => Promise<void>;
 }) {
   // overrides-модель: рендерим из серверных props.chapters, локально храним
   // ТОЛЬКО изменённые поля (ключ `${index}.${field}`). Поэтому новые главы/
@@ -888,6 +1053,20 @@ function Chapters(props: {
               {c.dialogue == null && <span className="cbadge wait">черновик плана</span>}
             </button>
             {open && (<>
+
+            {/* #7: вставить главу после этой / удалить эту */}
+            <div className="chap-ops">
+              <button className="xs ghost" disabled={props.busy}
+                onClick={() => props.onAddChapter(c.index)}
+                title="ИИ вставит новую главу после этой">
+                <Plus size={12} /> вставить после
+              </button>
+              <button className="xs ghost" disabled={props.busy || props.chapters.length <= 1}
+                onClick={() => props.onDeleteChapter(c.index)}
+                title="Удалить эту главу">
+                <X size={12} /> удалить главу
+              </button>
+            </div>
 
             {/* пре-чек адалта: главе не из чего генерить сцену */}
             {c.adult_block_reason && (

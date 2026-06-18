@@ -43,13 +43,33 @@ def _sub_llm():
     return ClaudeSubLLM(_sub_model())
 
 
+def _use_subscription(state: State | None = None,
+                      stage: str | None = None) -> bool:
+    """Использовать ли подписку Claude для этого этапа (#5).
+
+    Приоритет: пер-этапный оверрайд из state.stage_providers > фолбэк
+    force_openrouter (лимит подписки исчерпан) > глобальный тумблер env.
+    """
+    if state is not None:
+        if state.get("force_openrouter"):
+            return False
+        choice = (state.get("stage_providers") or {}).get(stage or "")
+        if choice == "subscription":
+            return True
+        if choice == "openrouter":
+            return False
+    return _subscription_on()
+
+
 # НЕ кэшируем структурный/редактор — чтобы тумблер подписки применялся сразу.
-def _structural():
-    return _sub_llm() if _subscription_on() else LLM(structural_provider())
+def _structural(state: State | None = None, stage: str | None = None):
+    return (_sub_llm() if _use_subscription(state, stage)
+            else LLM(structural_provider()))
 
 
-def _editor():
-    return _sub_llm() if _subscription_on() else LLM(editor_provider())
+def _editor(state: State | None = None, stage: str | None = None):
+    return (_sub_llm() if _use_subscription(state, stage)
+            else LLM(editor_provider()))
 
 
 # Адалт ВСЕГДА через uncensored-модель (подписка Claude цензурит) — кэшируем.
@@ -89,6 +109,13 @@ def _sys(state: State, base: str, names: bool = False) -> str:
     return out
 
 
+def _loc_block(state: State) -> str:
+    """Блок канон-локаций для контекста (пусто, если бот локаций не отработал)."""
+    loc = (state.get("locations") or "").strip()
+    return (f"\n\nЛокации (канон — используй эти места и их CamelCase-теги "
+            f"для статиков):\n{loc}") if loc else ""
+
+
 # ---------- Боты 1-4: линейная часть ----------
 
 def logline_node(state: State) -> dict:
@@ -97,7 +124,8 @@ def logline_node(state: State) -> dict:
     if fb:
         user += f"\n\nПрошлые логлайны:\n{state.get('logline', '')}\n\n{fb}"
     user += prompts.NO_META
-    out = _structural().complete(_sys(state, prompts.LOGLINE, names=True), user)
+    out = _structural(state, "logline").complete(
+        _sys(state, prompts.LOGLINE, names=True), user)
     loglines = parse_loglines(out)
     return {
         "logline": out,
@@ -117,7 +145,8 @@ def synopsis_node(state: State) -> dict:
     if fb:
         user += f"\n\nПредыдущий синопсис:\n{state.get('synopsis', '')}\n\n{fb}"
     user += prompts.NO_META
-    out = _structural().complete(_sys(state, prompts.SYNOPSIS, names=True), user)
+    out = _structural(state, "synopsis").complete(
+        _sys(state, prompts.SYNOPSIS, names=True), user)
     return {
         "synopsis": out,
         "revision_feedback": None,
@@ -132,7 +161,8 @@ def characters_node(state: State) -> dict:
     if fb:
         user += f"\n\nПредыдущие карточки:\n{state.get('characters', '')}\n\n{fb}"
     user += prompts.NO_META
-    out = _structural().complete(_sys(state, prompts.CHARACTERS, names=True), user)
+    out = _structural(state, "characters").complete(
+        _sys(state, prompts.CHARACTERS, names=True), user)
     return {
         "characters": out,
         "revision_feedback": None,
@@ -141,12 +171,34 @@ def characters_node(state: State) -> dict:
     }
 
 
+def locations_node(state: State) -> dict:
+    """Бот локаций — карточки мест действия (канон локаций), как персонажи.
+
+    Идёт после персонажей, до структуры. Локации потом юзаются в структуре и
+    при написании глав (единые названия + CamelCase-теги статиков)."""
+    fb = state.get("revision_feedback") or ""
+    user = (f"Синопсис:\n{state.get('synopsis', '')}\n\n"
+            f"Карточки персонажей:\n{state.get('characters', '')}")
+    if fb:
+        user += f"\n\nПредыдущие локации:\n{state.get('locations', '')}\n\n{fb}"
+    user += prompts.NO_META
+    out = _structural(state, "locations").complete(
+        _sys(state, prompts.LOCATIONS, names=True), user)
+    return {
+        "locations": out,
+        "revision_feedback": None,
+        "revision_target": None,
+        "log": ["✓ Бот локаций: карточки локаций готовы"],
+    }
+
+
 def _gen_chapter_batch(state: State, start: int, n: int) -> tuple[list[Chapter], bool]:
     """Генерит порцию из n глав начиная с индекса start (0-based). → (главы, done)."""
     existing = list(state.get("chapters") or [])
     fb = state.get("revision_feedback") or ""
 
-    ctx = f"Синопсис:\n{state['synopsis']}\n\nКарточки:\n{state['characters']}"
+    ctx = (f"Синопсис:\n{state['synopsis']}\n\n"
+           f"Карточки:\n{state['characters']}" + _loc_block(state))
     if existing:
         prev = "\n\n".join(
             f"Глава {c.index + 1}: {c.title}\n{c.plan}" for c in existing
@@ -158,7 +210,7 @@ def _gen_chapter_batch(state: State, start: int, n: int) -> tuple[list[Chapter],
     system = _sys(state, prompts.STRUCTURE, names=True)
     suffix = prompts.STRUCTURE_BATCH_SUFFIX.format(n=n, start=start + 1)
     try:
-        plan = _structural().structured(
+        plan = _structural(state, "structure").structured(
             system + suffix + prompts.STRUCTURE_JSON_SUFFIX, ctx,
             StructurePlan, temperature=0.7,
         )
@@ -168,7 +220,7 @@ def _gen_chapter_batch(state: State, start: int, n: int) -> tuple[list[Chapter],
         if not full:
             raise ValueError("пустая порция")
     except Exception:  # фолбэк: проза + regex-разбор по «ГЛАВА N» (адалт гейтит пре-чек)
-        out = _structural().complete(system + suffix, ctx)
+        out = _structural(state, "structure").complete(system + suffix, ctx)
         full = [(c.title, c.plan, True, "") for c in parse_chapters(out)]
         story_complete = False
 
@@ -205,7 +257,7 @@ def chapter_count_node(state: State) -> dict:
         "только если сюжет реально не умещается. Адалт должен идти рано и часто."
     )
     try:
-        out = _structural().structured(
+        out = _structural(state, "chapter_count").structured(
             "Ты — продюсер визуальных новелл. Оцени оптимальный объём. "
             "Не раздувай: предпочитай компактные истории (~6 глав).",
             user, ChapterCountOut, temperature=0.3)
@@ -290,11 +342,21 @@ def structure_node(state: State) -> dict:
 def _gen_full_structure(state: State, target: int) -> list[Chapter]:
     """Вся структура за один structured-запрос на точное число глав."""
     ctx = (f"Синопсис:\n{state['synopsis']}\n\n"
-           f"Карточки:\n{state['characters']}")
+           f"Карточки:\n{state['characters']}" + _loc_block(state))
+    # #7: если план уже есть — пересобираем ПОД новое число глав, растягивая/
+    # сжимая существующий сюжет, а не выдумывая с нуля (и не обрезая).
+    existing = list(state.get("chapters") or [])
+    if existing:
+        prev = "\n\n".join(f"Глава {c.index + 1}: {c.title}\n{c.plan}"
+                           for c in existing)
+        ctx += (f"\n\nТЕКУЩИЙ ПЛАН ({len(existing)} глав) — пересобери его РОВНО "
+                f"под {target} глав: растяни или сожми сюжет, сохрани удачные "
+                f"главы/повороты и канон, не выдумывай новую историю и не "
+                f"обрезай концовку:\n{prev}")
     system = _sys(state, prompts.STRUCTURE, names=True)
     suffix = prompts.STRUCTURE_FULL_SUFFIX.format(n=target)
     try:
-        plan = _structural().structured(
+        plan = _structural(state, "structure").structured(
             system + suffix + prompts.STRUCTURE_JSON_SUFFIX, ctx,
             StructurePlan, temperature=0.7,
         )
@@ -303,7 +365,7 @@ def _gen_full_structure(state: State, target: int) -> list[Chapter]:
         if not full:
             raise ValueError("пустая структура")
     except Exception:  # фолбэк: проза + regex-разбор «ГЛАВА N»
-        out = _structural().complete(system + suffix, ctx)
+        out = _structural(state, "structure").complete(system + suffix, ctx)
         full = [(c.title, c.plan, True, "") for c in parse_chapters(out)]
 
     chapters: list[Chapter] = []
@@ -315,6 +377,44 @@ def _gen_full_structure(state: State, target: int) -> list[Chapter]:
             is_adult_point=is_adult, adult_note=note or "",
         ))
     return chapters
+
+
+def gen_inserted_chapter(state: State, after_idx: int) -> Chapter:
+    """#7: сгенерировать ОДНУ новую главу для вставки после after_idx.
+
+    Связывает соседние главы (плавный переход), не переписывая остальные.
+    Индекс выставит вызывающий код после вставки/переиндексации.
+    """
+    chapters = list(state.get("chapters") or [])
+    before = chapters[after_idx] if 0 <= after_idx < len(chapters) else None
+    after = chapters[after_idx + 1] if after_idx + 1 < len(chapters) else None
+    around = ""
+    if before:
+        around += f"\n\nПРЕДЫДУЩАЯ глава {before.index + 1}: {before.title}\n{before.plan}"
+    if after:
+        around += f"\n\nСЛЕДУЮЩАЯ глава {after.index + 1}: {after.title}\n{after.plan}"
+    ctx = (f"Синопсис:\n{state.get('synopsis', '')}\n\n"
+           f"Карточки:\n{state.get('characters', '')}" + _loc_block(state)
+           + around
+           + "\n\nСгенерируй РОВНО ОДНУ новую главу, которая логично встаёт "
+           "между предыдущей и следующей (плавный переход, без дыр и повторов). "
+           "Соблюдай адалт-разнообразие. Верни массив chapters c одним объектом.")
+    system = _sys(state, prompts.STRUCTURE, names=True)
+    try:
+        plan = _structural(state, "structure").structured(
+            system + prompts.STRUCTURE_JSON_SUFFIX, ctx, StructurePlan,
+            temperature=0.7)
+        c = plan.chapters[0]
+        plan_text = c.plan
+        if c.is_adult and c.adult_note:
+            plan_text = f"{plan_text}\n\n[Адалт-точка: {c.adult_note}]"
+        return Chapter(index=after_idx + 1, title=c.title, plan=plan_text,
+                       is_adult_point=bool(c.is_adult),
+                       adult_note=c.adult_note or "")
+    except Exception:
+        return Chapter(index=after_idx + 1, title="Новая глава",
+                       plan="(план не сгенерировался — отредактируй вручную)",
+                       is_adult_point=True, adult_note="")
 
 
 def structure_editor_node(state: State) -> dict:
@@ -335,11 +435,12 @@ def structure_editor_node(state: State) -> dict:
     )
     user = (
         f"Синопсис:\n{state.get('synopsis', '')}\n\n"
-        f"Карточки персонажей:\n{state.get('characters', '')}\n\n"
-        f"Поглавный план ({len(chapters)} глав):\n{plan_text}"
+        f"Карточки персонажей:\n{state.get('characters', '')}"
+        + _loc_block(state)
+        + f"\n\nПоглавный план ({len(chapters)} глав):\n{plan_text}"
     )
     try:
-        out = _structural().structured(
+        out = _structural(state, "structure_editor").structured(
             _sys(state, prompts.STRUCTURE_EDITOR, names=True)
             + prompts.STRUCTURE_EDITOR_JSON,
             user, StructureFixOut, temperature=0.4,
@@ -374,8 +475,8 @@ def write_chapter(state: State, ch: Chapter, idx: int,
     (dialogue/statics/anims). Адалт-глава пишется uncensored-моделью.
     """
     user = (
-        f"Карточки персонажей:\n{state['characters']}\n\n"
-        f"Номер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
+        f"Карточки персонажей:\n{state['characters']}" + _loc_block(state)
+        + f"\n\nНомер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
         f"Глава для написания:\n{ch.title}\n{ch.plan}"
     )
     if feedback:
@@ -396,7 +497,7 @@ def write_chapter(state: State, ch: Chapter, idx: int,
     else:
         system = _sys(state, prompts.DIALOGUE, names=True) + prompts.STATICS_DIALOGUE
         # модель = подписка Claude (если вкл) ИНАЧЕ фоллбек на OpenRouter-ключ
-        llm = _structural()
+        llm = _structural(state, "dialogue")
 
     try:
         out = llm.structured(system, user, DialogueOut, temperature=0.7)
@@ -461,11 +562,11 @@ def patch_chapter(state: State, ch: Chapter, idx: int,
     else:
         system = (_sys(state, prompts.DIALOGUE, names=True)
                   + prompts.STATICS_DIALOGUE)
-        llm = _structural()
+        llm = _structural(state, "dialogue")
 
     user = (
-        f"Карточки персонажей (канон):\n{state['characters']}\n\n"
-        f"Номер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
+        f"Карточки персонажей (канон):\n{state['characters']}" + _loc_block(state)
+        + f"\n\nНомер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
         f"ТЕКУЩИЙ ТЕКСТ ГЛАВЫ «{ch.title}»:\n{ch.dialogue or ''}\n\n"
         f"ЗАМЕЧАНИЯ РЕДАКТОРА — исправь ТОЧЕЧНО только эти места:\n{issues}"
     )
@@ -501,7 +602,7 @@ def sync_plan_from_dialogue(state: State, ch: Chapter, idx: int) -> str:
         "локации, что происходит, эмоциональная дуга, точки выбора, адалт-точка. "
         "Верни только новый план главы, без преамбул."
     )
-    return _structural().complete(
+    return _structural(state, "dialogue").complete(
         _sys(state, prompts.STRUCTURE, names=True), user)
 
 
@@ -572,7 +673,8 @@ def adult_node(state: State) -> dict:
     pair_hint = ""
     if not is_revision:  # пре-чек только на первичной генерации, не на ретраях
         try:
-            chk = _editor().structured(prompts.ADULT_FEASIBILITY, ctx, AdultFeasibility)
+            chk = _editor(state, "editor").structured(
+                prompts.ADULT_FEASIBILITY, ctx, AdultFeasibility)
         except Exception:
             chk = None  # пре-чек упал → не блокируем, пробуем генерить
         if chk and not chk.feasible:
@@ -684,7 +786,8 @@ def editor_node(state: State) -> dict:
             f"НЕ повторяй их и ничего похожего:\n{joined}"
         )
     try:
-        out: EditorReportOut = _editor().structured(prompts.EDITOR, user, EditorReportOut)
+        out: EditorReportOut = _editor(state, "editor").structured(
+            prompts.EDITOR, user, EditorReportOut)
     except Exception as exc:
         report = EditorReport(chapter_index=idx, findings=[],
                               markdown=f"[редактор пропущен: {exc}]")
@@ -727,7 +830,7 @@ def translation_node(state: State) -> dict:
         text = ch.dialogue or ""
         if ch.adult_scene:
             text += f"\n\n--- АДАЛТ ---\n{ch.adult_scene}"
-        ch.translation = _structural().complete(
+        ch.translation = _structural(state, "translation").complete(
             prompts.TRANSLATION,
             f"Целевой язык: {lang}\n\nТекст:\n{text}",
         )
