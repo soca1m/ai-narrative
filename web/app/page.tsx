@@ -30,6 +30,8 @@ import {
   RunSummary,
   listRuns,
   claudeStatus,
+  claudeUsage,
+  ClaudeRateLimit,
   claudeAuthUrl,
   claudeExchange,
   setClaudeSubscription,
@@ -251,11 +253,17 @@ export default function Page() {
     [events],
   );
 
+  // poll() пересоздаёт tick() один раз и реschedule'ит сам себя — он держит
+  // СТАРОЕ замыкание dirty. Через ref читаем актуальный dirty, иначе синк затрёт
+  // правку, которую юзер начал после старта поллинга.
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+
   function syncDrafts(s: NarrativeState) {
     setDrafts((prev) => {
       const d = { ...prev };
       for (const k of ["synopsis", "characters", "locations"] as const) {
-        if (dirty.has(k)) continue;
+        if (dirtyRef.current.has(k)) continue;
         // строка из state → в черновик; пусто/None (после отката) → очищаем,
         // иначе блок не исчезает (EditableCard скрывается при пустом value).
         d[k] = typeof s[k] === "string" ? (s[k] as string) : "";
@@ -315,27 +323,41 @@ export default function Page() {
     if (!threadId || !reCount) return;
     if (!confirm(`Пересобрать структуру под ${reCount} глав? Сюжет растянется/`
       + `сожмётся, написанные тексты глав сбросятся.`)) return;
-    await restructure(threadId, +reCount);
-    setReCount(""); setStatus("running"); poll(threadId);
+    try {
+      setErr(null);
+      await restructure(threadId, +reCount);
+      setReCount(""); setStatus("running"); poll(threadId);
+    } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось пересобрать"); }
   }
   async function onAddChapter(after: number, isAdult = true) {
     if (!threadId) return;
-    await addChapter(threadId, after, isAdult);
-    setStatus("running"); poll(threadId);
+    try {
+      setErr(null);
+      await addChapter(threadId, after, isAdult);
+      setStatus("running"); poll(threadId);
+    } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось добавить главу"); }
   }
   async function onDeleteChapter(idx: number) {
     if (!threadId) return;
     if (!confirm(`Удалить главу ${idx + 1}?`)) return;
-    await deleteChapter(threadId, idx); refresh();
+    try {
+      setErr(null);
+      await deleteChapter(threadId, idx); refresh();
+    } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось удалить главу"); }
   }
 
   // #5: решение по исчерпанному лимиту провайдера
   async function onLimit(action: "switch" | "wait" | "subscription") {
     if (!threadId) return;
-    try { await resolveLimit(threadId, action); } catch {}
-    setLimit(null);
-    if (action !== "wait") setStatus("running");
-    poll(threadId);
+    try {
+      setErr(null);
+      await resolveLimit(threadId, action);
+      setLimit(null);
+      if (action !== "wait") setStatus("running");
+      poll(threadId);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Не удалось применить решение по лимиту");
+    }
   }
 
   function edit(key: string, val: string) {
@@ -635,6 +657,14 @@ export default function Page() {
                 </button>
               </div>
             )}
+
+            <StageProviderPanel
+              threadId={threadId}
+              providers={st.stage_providers ?? {}}
+              forceOR={!!st.force_openrouter}
+              disabled={busy}
+              onChanged={refresh}
+            />
 
             <h2 className="section">Лента событий</h2>
             <div className="feed">
@@ -1452,11 +1482,17 @@ function ClaudeSubPanel() {
   const [showAuth, setShowAuth] = useState(false);
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
+  const [rl, setRl] = useState<ClaudeRateLimit | null>(null);
 
   async function load() {
     try { const r = await claudeStatus(); setS(r); setModel(r.model || "sonnet"); } catch {}
+    try { const u = await claudeUsage(); setRl(u.rate_limit); } catch {}
   }
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 30000);  // проактивно обновляем остаток лимита
+    return () => clearInterval(t);
+  }, []);
 
   async function toggle(enabled: boolean) {
     setBusy(true);
@@ -1505,6 +1541,17 @@ function ClaudeSubPanel() {
           : "не авторизован"}
       </div>
       {s?.warn && <div className="sp-warn"><AlertTriangle size={13} /> {s.warn}</div>}
+      {rl && (rl.utilization != null || rl.resets_at != null) && (
+        <div className={`sp-usage ${rl.status === "rejected" ? "rej" : rl.status === "allowed_warning" ? "warn" : ""}`}>
+          {rl.utilization != null && (
+            <>Лимит израсходован: <b>{Math.round(rl.utilization * 100)}%</b></>
+          )}
+          {rl.resets_at != null && (
+            <> · сброс {new Date(rl.resets_at * 1000).toLocaleString()}</>
+          )}
+          {rl.status === "rejected" && <> · исчерпан</>}
+        </div>
+      )}
 
       <div className="check" style={{ margin: "8px 0" }}>
         <input id="suball" type="checkbox" disabled={!s?.authorized || busy}

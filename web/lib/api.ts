@@ -180,6 +180,16 @@ export type ClaudeStatus = {
 };
 export const claudeStatus = (): Promise<ClaudeStatus> =>
   fetch(`${API_BASE}/api/claude/status`).then((r) => r.json());
+
+export type ClaudeRateLimit = {
+  status?: "allowed" | "allowed_warning" | "rejected" | null;
+  resets_at?: number | null;
+  rate_limit_type?: string | null;
+  utilization?: number | null;
+  overage_status?: string | null;
+};
+export const claudeUsage = (): Promise<{ rate_limit: ClaudeRateLimit | null }> =>
+  fetch(`${API_BASE}/api/claude/usage`).then((r) => r.json());
 export const setClaudeSubscription = (enabled: boolean, model?: string): Promise<ClaudeStatus> =>
   jpost("/api/claude/subscription", { enabled, model });
 export const setClaudeToken = (token: string): Promise<ClaudeStatus> =>

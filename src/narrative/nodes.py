@@ -11,7 +11,7 @@ from functools import lru_cache
 
 from . import live, prompts
 from .config import adult_provider, editor_provider, structural_provider
-from .llm import LLM
+from .llm import LLM, LLMLimitError
 from .routing import retry_key
 from .state import (
     AdultFeasibility,
@@ -439,6 +439,8 @@ def gen_inserted_chapter(state: State, after_idx: int) -> Chapter:
         return Chapter(index=after_idx + 1, title=c.title, plan=plan_text,
                        is_adult_point=bool(c.is_adult),
                        adult_note=c.adult_note or "")
+    except LLMLimitError:
+        raise  # лимит → пусть обработает _bg_op (баннер выбора), не глотаем
     except Exception:
         return Chapter(index=after_idx + 1, title="Новая глава",
                        plan="(план не сгенерировался — отредактируй вручную)",

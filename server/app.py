@@ -487,6 +487,12 @@ def revise_stage(thread_id: str, stage: str, req: ReviseReq):
     _busy(run)
     if stage not in NODE_FUNCS:
         raise HTTPException(400, f"unknown stage {stage}")
+    # поглавные узлы требуют chapter_idx (из запроса или уже в state) — иначе
+    # node упадёт на state["chapter_idx"] с KeyError → 500 с трейсом.
+    if stage in ("dialogue", "adult", "editor"):
+        st0 = _state(thread_id)
+        if req.chapter_idx is None and st0.get("chapter_idx") is None:
+            raise HTTPException(400, f"stage {stage} требует chapter_idx")
 
     def _op():
         st = _state(thread_id)
@@ -527,7 +533,7 @@ def revise_chapter(thread_id: str, idx: int, req: ReviseReq):
             "непрерывность с остальными. Верни только новый текст плана, "
             "без преамбул."
         )
-        ch.plan = nodes._structural().complete(
+        ch.plan = nodes._structural(st2, "structure").complete(
             prompts.with_genre(prompts.STRUCTURE, st2.get("genre"))
             + prompts.NAMES_RULE, user)
         chapters[idx] = ch
@@ -930,6 +936,7 @@ def _revision_worker(run: Run, idx: int, to_fix: list, convo: str):
     """ФОНОВО: точечная правка главы + перепроверка. LLM-правка адалта долгая
     (grok 30-150с), поэтому НЕ держим HTTP-запрос (иначе Next-прокси рвёт по
     таймауту → 500). Фронт поллит status: running → paused/error."""
+    from narrative import live  # noqa: PLC0415
     thread_id = run.thread_id
     run.status = "running"
     run.error = ""
@@ -952,10 +959,19 @@ def _revision_worker(run: Run, idx: int, to_fix: list, convo: str):
         run.events.put({"type": "edited",
                         "keys": ["chapters", "editor_reports"]})
         run.events.put({"type": "status", "status": "paused"})
+    except LLMLimitError as exc:  # #5: лимит → баннер выбора, прогресс цел
+        run.limit = {"provider": exc.provider, "reset_at": exc.reset_at,
+                     "kind": exc.kind, "message": str(exc)[:200]}
+        run.status = "limit"
+        run.events.put({"type": "status", "status": "limit",
+                        "limit": run.limit})
     except Exception as exc:  # noqa: BLE001
         run.status = "error"
         run.error = f"Не удалось применить правки (LLM/провайдер): {str(exc)[:200]}"
         run.events.put({"type": "status", "status": "error", "error": run.error})
+    finally:
+        live.clear()
+        run.gen = None
 
 
 @app.post("/api/runs/{thread_id}/chapter/{idx}/apply_revision")
@@ -1124,6 +1140,15 @@ def claude_status():
     st["enabled"] = _os.environ.get("USE_CLAUDE_SUBSCRIPTION") == "1"
     st["model"] = _os.environ.get("CLAUDE_SUB_MODEL", "sonnet")
     return st
+
+
+@app.get("/api/claude/usage")
+def claude_usage():
+    """Проактивный остаток лимита подписки Claude — из последнего RateLimitEvent
+    SDK (utilization 0..1, время сброса, статус). None-поля = SDK ещё не сообщил."""
+    from narrative.claude_sub import last_rate_limit  # noqa: PLC0415
+    rl = last_rate_limit()
+    return {"rate_limit": rl}
 
 
 class SubReq(BaseModel):
