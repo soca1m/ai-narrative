@@ -105,7 +105,9 @@ export type LimitInfo = {
 export async function getState(
   threadId: string,
 ): Promise<{ status: string; next: string[]; error?: string;
-  limit?: LimitInfo | null; state: NarrativeState }> {
+  limit?: LimitInfo | null;
+  gen?: { stage: string; idx: number | null; text: string } | null;
+  state: NarrativeState }> {
   const r = await fetch(`${API_BASE}/api/runs/${threadId}/state`);
   if (!r.ok) throw new Error(`state failed: ${r.status}`);
   return r.json();
@@ -147,8 +149,8 @@ export const setChapterCount = (id: string, count: number) =>
 export const restructure = (id: string, count: number) =>
   jpost(`/api/runs/${id}/restructure`, { count });
 // #7: добавить главу после индекса (-1 → в начало), ИИ генерит план
-export const addChapter = (id: string, after_idx: number) =>
-  jpost(`/api/runs/${id}/chapter/add`, { after_idx });
+export const addChapter = (id: string, after_idx: number, is_adult = true) =>
+  jpost(`/api/runs/${id}/chapter/add`, { after_idx, is_adult });
 // #7: удалить главу
 export const deleteChapter = (id: string, idx: number) =>
   fetch(`${API_BASE}/api/runs/${id}/chapter/${idx}`, { method: "DELETE" })

@@ -17,9 +17,34 @@ from openai import (
 )
 from pydantic import BaseModel
 
+from . import live
 from .config import ProviderConfig
 
 T = TypeVar("T", bound=BaseModel)
+
+_STREAM_EVERY = 48  # эмитим партиал каждые ~N новых символов (плавно, но не спамит)
+
+
+def _stream_text(stream) -> str:
+    """Гоняет stream-ответ, шлёт нарастающий текст в live.feed, возвращает финал."""
+    acc: list[str] = []
+    sent = 0
+    for chunk in stream:
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        piece = getattr(delta, "content", None) if delta else None
+        if not piece:
+            continue
+        acc.append(piece)
+        total = sum(len(x) for x in acc)
+        if total - sent >= _STREAM_EVERY:
+            live.feed("".join(acc))
+            sent = total
+    full = "".join(acc)
+    live.feed(full)
+    return full
 
 
 class LLMLimitError(Exception):
@@ -125,8 +150,12 @@ class LLM:
 
     def complete(self, system: str, user: str,
                  temperature: Optional[float] = None) -> str:
-        """Обычная генерация текста (используют все боты кроме редактора)."""
-        resp = self._create(
+        """Обычная генерация текста (используют все боты кроме редактора).
+
+        Если активен live-sink (узел стримит во фронт) — идём через stream=True
+        и шлём нарастающий текст; иначе обычный запрос.
+        """
+        kwargs = dict(
             model=self.cfg.model,
             temperature=self.cfg.temperature if temperature is None else temperature,
             messages=[
@@ -135,7 +164,9 @@ class LLM:
             ],
             **self._max_tokens_kwarg(),
         )
-        return resp.choices[0].message.content or ""
+        if live.active():
+            return _stream_text(self._create(stream=True, **kwargs))
+        return self._create(**kwargs).choices[0].message.content or ""
 
     def chat(self, system: str, messages: list[dict],
              temperature: Optional[float] = None) -> str:
@@ -163,7 +194,7 @@ class LLM:
           2. _extract_json — снимает markdown-ограждение, если осталось;
           3. model_validate_json — финальная валидация.
         """
-        resp = self._create(
+        kwargs = dict(
             model=self.cfg.model,
             temperature=temperature,
             response_format={
@@ -180,7 +211,11 @@ class LLM:
             ],
             **self._max_tokens_kwarg(),
         )
-        raw = resp.choices[0].message.content or "{}"
+        # стрим JSON: фронт извлекает текст «на лету» (диалоги/структура в полях)
+        if live.active():
+            raw = _stream_text(self._create(stream=True, **kwargs)) or "{}"
+        else:
+            raw = self._create(**kwargs).choices[0].message.content or "{}"
         return schema.model_validate_json(_extract_json(raw))
 
 

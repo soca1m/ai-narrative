@@ -64,12 +64,15 @@ class ClaudeSubLLM:
             max_tokens = 0
         self.cfg = _Cfg()
 
-    # --- внутреннее: один прогон через SDK ---
+    # --- внутреннее: один прогон через SDK (+ live-стрим во фронт) ---
     async def _aquery(self, system: str, prompt: str) -> str:
         from claude_agent_sdk import (  # noqa: PLC0415 — ленивый импорт
             AssistantMessage, ClaudeAgentOptions, TextBlock, query,
         )
-        opts = ClaudeAgentOptions(
+        from . import live  # noqa: PLC0415
+
+        streaming = live.active()
+        opt_kwargs = dict(
             system_prompt=system,
             model=self.model,
             # запас ходов: на длинном structured-выводе SDK иногда требует >1
@@ -77,12 +80,38 @@ class ClaudeSubLLM:
             max_turns=8,
             allowed_tools=[],  # чистая генерация, без инструментов
         )
+        # партиальные сообщения → видно генерацию по мере написания
+        if streaming:
+            try:
+                opt_kwargs["include_partial_messages"] = True
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            opts = ClaudeAgentOptions(**opt_kwargs)
+        except TypeError:  # старый SDK без include_partial_messages
+            opt_kwargs.pop("include_partial_messages", None)
+            opts = ClaudeAgentOptions(**opt_kwargs)
+
         chunks: list[str] = []
+        partial = ""  # текст текущего (ещё не финализированного) блока
         async for msg in query(prompt=prompt, options=opts):
+            # потоковые дельты (если SDK их шлёт)
+            ev = getattr(msg, "event", None) or getattr(msg, "delta", None)
+            if streaming and ev is not None:
+                txt = getattr(ev, "text", None)
+                if not txt and isinstance(ev, dict):
+                    txt = (ev.get("delta") or {}).get("text") or ev.get("text")
+                if txt:
+                    partial += txt
+                    live.feed("".join(chunks) + partial)
+                    continue
             if isinstance(msg, AssistantMessage):
+                partial = ""
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         chunks.append(block.text)
+                if streaming:
+                    live.feed("".join(chunks))
         return "".join(chunks)
 
     def _run(self, system: str, prompt: str) -> str:

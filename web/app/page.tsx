@@ -109,6 +109,18 @@ function downloadText(filename: string, text: string) {
   document.body.removeChild(a); URL.revokeObjectURL(url);
 }
 
+// live-текст: complete()-этапы шлют чистый текст, structured()-этапы (диалоги) —
+// сырой JSON. Вытаскиваем поле script на лету, чтобы показывать читаемый текст.
+function cleanLive(t: string): string {
+  if (!t) return "";
+  const m = t.indexOf('"script":"');
+  if (m < 0) return t;
+  let s = t.slice(m + '"script":"'.length);
+  const tail = s.search(/","(statics|anims)"/);
+  if (tail >= 0) s = s.slice(0, tail);
+  return s.replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\t/g, "  ").replace(/\\\\/g, "\\");
+}
+
 type Ev = { i: number; kind: string; bot: number; chapter: number | null; text: string };
 
 function classifyLog(lines: string[]): Ev[] {
@@ -212,6 +224,7 @@ export default function Page() {
   const [limit, setLimit] = useState<LimitInfo | null>(null);
   const [applyingRev, setApplyingRev] = useState(false);
   const [st, setSt] = useState<NarrativeState>({});
+  const [gen, setGen] = useState<{ stage: string; idx: number | null; text: string } | null>(null);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -271,10 +284,12 @@ export default function Page() {
         setNext(r.next);
         setErr(r.error || null);
         setLimit(r.limit || null);
+        setGen(r.gen || null);
         setSt(r.state);
         syncDrafts(r.state);
         if (r.status === "running" || r.status === "idle")
-          pollRef.current = setTimeout(tick, 1500);
+          // во время генерации поллим часто → видно как ИИ пишет текст
+          pollRef.current = setTimeout(tick, r.gen ? 400 : 1200);
       } catch {
         pollRef.current = setTimeout(tick, 2000);
       }
@@ -303,9 +318,9 @@ export default function Page() {
     await restructure(threadId, +reCount);
     setReCount(""); setStatus("running"); poll(threadId);
   }
-  async function onAddChapter(after: number) {
+  async function onAddChapter(after: number, isAdult = true) {
     if (!threadId) return;
-    await addChapter(threadId, after);
+    await addChapter(threadId, after, isAdult);
     setStatus("running"); poll(threadId);
   }
   async function onDeleteChapter(idx: number) {
@@ -350,6 +365,24 @@ export default function Page() {
     translation: !!st.chapters?.some((c) => c.translation),
   };
   const activeStage = next[0] ?? null;
+  // этап сейчас генерится и его артефакт ещё не готов → показать блок-плейсхолдер
+  // gen.stage (что РЕАЛЬНО генерится сейчас, вкл. ревизии) приоритетнее
+  // activeStage (next-узел графа) — иначе ревизия логлайна покажет «синопсис».
+  const showGen = (stage: string) =>
+    status === "running" && !has[stage]
+    && (gen ? gen.stage === stage : activeStage === stage);
+  // человекочитаемое имя того, что генерится сейчас (для индикатора)
+  const STAGE_RU: Record<string, string> = {
+    logline: "логлайн", synopsis: "синопсис", characters: "персонажи",
+    locations: "локации", structure: "структуру", dialogue: "главу", chat: "ответ",
+  };
+  // live-текст для этапа (нарастающий вывод модели), если он сейчас этот
+  const liveFor = (stage: string) =>
+    gen?.stage === stage ? cleanLive(gen.text) : undefined;
+  // активная глава пишется → live-скелет в её карточке
+  const writingIdx = gen?.stage === "dialogue" ? gen.idx
+    : (status === "running" && activeStage === "dialogue" ? (st.chapter_idx ?? 0) : null);
+  const writingText = gen?.stage === "dialogue" ? cleanLive(gen.text) : undefined;
   // апрув числа глав: chapter_count предложил, структуры ещё нет
   const pausedAtCount = status === "paused"
     && (st.suggested_chapters ?? 0) > 0 && !st.chapters?.length;
@@ -530,7 +563,10 @@ export default function Page() {
             {busy && (
               <div className="working">
                 <Loader2 size={15} className="spin" />
-                ИИ работает… {curEdited
+                ИИ работает… {gen
+                  ? (STAGE_RU[gen.stage] ?? gen.stage)
+                  + (gen.stage === "dialogue" && gen.idx != null ? ` ${gen.idx + 1}` : "")
+                  : curEdited
                   ? `правка главы ${curIdx + 1}`
                   : nextLabel(next).toLowerCase()}
               </div>
@@ -600,14 +636,6 @@ export default function Page() {
               </div>
             )}
 
-            <StageProviderPanel
-              threadId={threadId}
-              providers={st.stage_providers ?? {}}
-              forceOR={!!st.force_openrouter}
-              disabled={busy}
-              onChanged={refresh}
-            />
-
             <h2 className="section">Лента событий</h2>
             <div className="feed">
               <AnimatePresence initial={false}>
@@ -666,14 +694,17 @@ export default function Page() {
               })}
             </div>
 
-            {/* ghost-превью: что сейчас генерируется / появится следующим */}
-            {activeStage && STAGE_DESC[activeStage] && !has[activeStage] && (
+            {/* ghost-превью оставляем ТОЛЬКО для этапов без своего GenCard
+                (число глав / редактор структуры / редактор) — у остальных
+                live-блок показывает сам процесс */}
+            {activeStage && STAGE_DESC[activeStage] && !has[activeStage]
+              && ["chapter_count", "structure_editor", "editor"].includes(activeStage) && (
               <motion.div className="preview" layout
                 initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}>
                 <span className={`ghost-dot ${status === "running" ? "live" : ""}`} />
                 <div>
                   <div className="ghost-t">
-                    {status === "running" ? "Сейчас генерируется" : "Далее"}:{" "}
+                    {status === "running" ? "Сейчас работает" : "Далее"}:{" "}
                     {STAGES.find((s) => s[0] === activeStage)?.[1] ?? activeStage}
                   </div>
                   <div className="ghost-d">{STAGE_DESC[activeStage]}</div>
@@ -698,13 +729,6 @@ export default function Page() {
               </div>
             )}
 
-            <div className="stats">
-              <Stat v={st.chapters?.length ?? 0} k="главы" />
-              <Stat v={botsRun} k="ботов" />
-              <Stat v={totalRevisions} k="правок" cls="rev" />
-              <Stat v={openCrit} k="критич." cls="crit" />
-            </div>
-
             {/* #7: управление числом глав — пересобрать / добавить */}
             {(st.chapters?.length ?? 0) > 0 && !projectDone && (
               <div className="chapctl">
@@ -717,20 +741,29 @@ export default function Page() {
                   <RefreshCw size={14} /> Пересобрать
                 </button>
                 <button className="small secondary" disabled={busy}
-                  onClick={() => onAddChapter((st.chapters?.length ?? 1) - 1)}
-                  title="ИИ допишет главу в конец">
-                  <Plus size={14} /> Глава в конец
+                  onClick={() => onAddChapter((st.chapters?.length ?? 1) - 1, true)}
+                  title="ИИ допишет адалт-главу в конец">
+                  <Plus size={14} /> Глава в конец 🔞
+                </button>
+                <button className="small ghost" disabled={busy}
+                  onClick={() => onAddChapter((st.chapters?.length ?? 1) - 1, false)}
+                  title="ИИ допишет обычную (неадалт) главу в конец">
+                  <Plus size={14} /> Без адалта
                 </button>
               </div>
             )}
 
             {/* Порядок убывания: свежие результаты сверху (главы → персонажи → синопсис → логлайн) */}
+            {showGen("structure") && <GenCard bot="06" title="Структура · поглавный план" rows={5} live={liveFor("structure")} />}
+
             <Chapters
               onAddChapter={onAddChapter}
               onDeleteChapter={onDeleteChapter}
               threadId={threadId}
               phase={st.phase}
               activeIdx={curIdx}
+              writingIdx={writingIdx}
+              writingText={writingText}
               onRefresh={refresh}
               busy={busy}
               canDownload={allWritten}
@@ -749,16 +782,8 @@ export default function Page() {
               onSkipAdult={(i) => guard(async () => { if (threadId) { await skipAdult(threadId, i); refresh(); } })}
             />
 
-            {/* Персонажи */}
-            <EditableCard
-              title="Персонажи · карточки = канон" bot="03" rows={12} valKey="characters" busy={busy}
-              value={drafts.characters ?? ""} dirty={dirty.has("characters")} saved={saved === "characters"}
-              onChange={(v) => edit("characters", v)} onSave={() => save("characters")}
-              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "characters", fb); refresh(); } })}
-              onRollback={currentStage === "characters" ? () => guard(async () => { if (threadId && confirm("Откатить этап персонажей: удалить карточки и сгенерировать заново?")) { await rollback(threadId, "characters"); refresh(); } }) : undefined}
-            />
-
-            {/* Локации */}
+            {/* Локации (генерятся ПОСЛЕ персонажей → выше них: свежее сверху) */}
+            {showGen("locations") && <GenCard bot="04" title="Локации · места действия (канон)" rows={4} live={liveFor("locations")} />}
             <EditableCard
               title="Локации · места действия (канон)" bot="04" rows={10} valKey="locations" busy={busy}
               value={drafts.locations ?? ""} dirty={dirty.has("locations")} saved={saved === "locations"}
@@ -767,7 +792,18 @@ export default function Page() {
               onRollback={currentStage === "locations" ? () => guard(async () => { if (threadId && confirm("Откатить этап локаций: удалить карточки локаций и сгенерировать заново?")) { await rollback(threadId, "locations"); refresh(); } }) : undefined}
             />
 
+            {/* Персонажи */}
+            {showGen("characters") && <GenCard bot="03" title="Персонажи · карточки = канон" rows={6} live={liveFor("characters")} />}
+            <EditableCard
+              title="Персонажи · карточки = канон" bot="03" rows={12} valKey="characters" busy={busy}
+              value={drafts.characters ?? ""} dirty={dirty.has("characters")} saved={saved === "characters"}
+              onChange={(v) => edit("characters", v)} onSave={() => save("characters")}
+              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "characters", fb); refresh(); } })}
+              onRollback={currentStage === "characters" ? () => guard(async () => { if (threadId && confirm("Откатить этап персонажей: удалить карточки и сгенерировать заново?")) { await rollback(threadId, "characters"); refresh(); } }) : undefined}
+            />
+
             {/* Синопсис */}
+            {showGen("synopsis") && <GenCard bot="02" title="Синопсис" rows={5} live={liveFor("synopsis")} />}
             <EditableCard
               title="Синопсис" bot="02" rows={10} valKey="synopsis" busy={busy}
               value={drafts.synopsis ?? ""} dirty={dirty.has("synopsis")} saved={saved === "synopsis"}
@@ -777,6 +813,7 @@ export default function Page() {
             />
 
             {/* Логлайн — выбор одного из вариантов */}
+            {showGen("logline") && <GenCard bot="01" title="Логлайн · варианты" rows={5} live={liveFor("logline")} />}
             <LoglineCard
               loglines={st.loglines ?? []}
               selected={st.selected_logline ?? ""}
@@ -802,7 +839,7 @@ function StageProviderPanel({
   const ROWS: [string, string][] = [
     ["logline", "Логлайн"], ["synopsis", "Синопсис"], ["characters", "Персонажи"],
     ["locations", "Локации"], ["chapter_count", "Объём"], ["structure", "Структура"],
-    ["structure_editor", "Ред. структуры"], ["dialogue", "Диалоги/Адалт"],
+    ["structure_editor", "Ред. структуры"], ["dialogue", "Диалоги (текст главы)"],
     ["editor", "Редактор"], ["translation", "Перевод"], ["chat", "Чат"],
   ];
   async function set(stage: string, v: string) {
@@ -820,6 +857,10 @@ function StageProviderPanel({
           <div className="sp-hint">
             Подписка Claude (дёшево) или OpenRouter (платно) — на каждый этап.
             «по умолч.» = глобальный тумблер выше.
+          </div>
+          <div className="sp-hint" style={{ color: "var(--brick-soft)" }}>
+            🔞 Адалт-главу ЦЕЛИКОМ пишет OpenRouter grok (без цензуры) — подписка
+            Claude её не напишет. Настройка «Диалоги» влияет только на НЕ-адалт главы.
           </div>
           <div className="provrow allrow">
             <span>Все этапы</span>
@@ -845,6 +886,32 @@ function StageProviderPanel({
         </div>
       )}
     </div>
+  );
+}
+
+// блок-плейсхолдер «ИИ пишет…»: скелет + спиннер, на месте будущего артефакта.
+// Появляется, пока этап генерится; превращается в обычный блок по готовности.
+function GenCard({ bot, title, rows = 4, live }: { bot: string; title: string; rows?: number; live?: string }) {
+  const txtRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => { if (txtRef.current) txtRef.current.scrollTop = txtRef.current.scrollHeight; }, [live]);
+  return (
+    <motion.div className="card gencard" layout
+      initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
+      <div className="head">
+        <span className="t"><span className="botnum">{bot}</span>{title}</span>
+        <span className="genbadge"><Loader2 size={14} className="spin" /> ИИ пишет…</span>
+      </div>
+      {live && live.trim() ? (
+        <div className="livetext" ref={txtRef}>{live}<span className="gencaret" /></div>
+      ) : (
+        <div className="skel">
+          {Array.from({ length: rows }).map((_, i) => (
+            <span key={i} className="sl" style={{ width: `${[94, 78, 88, 64, 90, 72][i % 6]}%` }} />
+          ))}
+        </div>
+      )}
+      <div className="genhint">Бот генерирует содержимое в реальном времени. Блок станет редактируемым по готовности.</div>
+    </motion.div>
   );
 }
 
@@ -929,6 +996,7 @@ function EditableCard(props: {
 function Chapters(props: {
   threadId: string;
   phase?: string; activeIdx?: number; busy?: boolean;
+  writingIdx?: number | null; writingText?: string;
   chapters: Chapter[]; reports: EditorReport[];
   canDownload?: boolean;
   onDownload?: (fmt: "txt" | "md") => void;
@@ -943,7 +1011,7 @@ function Chapters(props: {
   onDecide: (fid: string, body: { status?: FindingStatus; comment?: string; judge?: boolean }) => Promise<void>;
   onAdaptAdult: (i: number) => Promise<void>;
   onSkipAdult: (i: number) => Promise<void>;
-  onAddChapter: (after: number) => Promise<void>;
+  onAddChapter: (after: number, isAdult?: boolean) => Promise<void>;
   onDeleteChapter: (idx: number) => Promise<void>;
 }) {
   // overrides-модель: рендерим из серверных props.chapters, локально храним
@@ -995,6 +1063,13 @@ function Chapters(props: {
   }
   async function commit() {
     await props.onSaveAll(buildMerged());
+    setEdits({});
+  }
+  // мгновенно переключить адалт/неадалт у главы (с сохранением текущих правок)
+  async function toggleAdult(ch: Chapter) {
+    const merged = buildMerged().map((x) =>
+      x.index === ch.index ? { ...x, is_adult_point: !ch.is_adult_point } : x);
+    await props.onSaveAll(merged);
     setEdits({});
   }
   async function withWork(key: string, fn: () => Promise<void>) {
@@ -1054,17 +1129,27 @@ function Chapters(props: {
             </button>
             {open && (<>
 
-            {/* #7: вставить главу после этой / удалить эту */}
+            {/* #7: адалт-тоггл · вставить после (адалт/без) · удалить */}
             <div className="chap-ops">
+              <button className={`xs ${c.is_adult_point ? "" : "ghost"}`} disabled={props.busy}
+                onClick={() => toggleAdult(c)}
+                title="Сделать главу адалт / неадалт">
+                🔞 адалт: {c.is_adult_point ? "вкл" : "выкл"}
+              </button>
               <button className="xs ghost" disabled={props.busy}
-                onClick={() => props.onAddChapter(c.index)}
-                title="ИИ вставит новую главу после этой">
-                <Plus size={12} /> вставить после
+                onClick={() => props.onAddChapter(c.index, true)}
+                title="ИИ вставит адалт-главу после этой">
+                <Plus size={12} /> после 🔞
+              </button>
+              <button className="xs ghost" disabled={props.busy}
+                onClick={() => props.onAddChapter(c.index, false)}
+                title="ИИ вставит обычную (неадалт) главу после этой">
+                <Plus size={12} /> после (без адалта)
               </button>
               <button className="xs ghost" disabled={props.busy || props.chapters.length <= 1}
                 onClick={() => props.onDeleteChapter(c.index)}
                 title="Удалить эту главу">
-                <X size={12} /> удалить главу
+                <X size={12} /> удалить
               </button>
             </div>
 
@@ -1148,6 +1233,19 @@ function Chapters(props: {
             </div>
             <ChatBox threadId={props.threadId} chapterIdx={i} title="Обсудить главу с ИИ"
               disabled={props.busy} onApplied={props.onRefresh} />
+
+            {c.dialogue == null && props.writingIdx === i && (
+              <div className="geninline">
+                <span className="genbadge"><Loader2 size={14} className="spin" /> ИИ пишет главу{c.is_adult_point ? " (диалоги + адалт)" : ""}…</span>
+                {props.writingText && props.writingText.trim() ? (
+                  <div className="livetext">{props.writingText}<span className="gencaret" /></div>
+                ) : (
+                  <div className="skel">
+                    {[92, 76, 88, 64, 90].map((w, k) => <span key={k} className="sl" style={{ width: `${w}%` }} />)}
+                  </div>
+                )}
+              </div>
+            )}
 
             {c.dialogue != null && (<>
               <label>Диалоги + адалт · Бот 05</label>

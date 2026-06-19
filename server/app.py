@@ -89,6 +89,7 @@ class Run:
     worker: Optional[threading.Thread] = None
     error: str = ""  # текст последней ошибки воркера (для UI)
     limit: Optional[dict] = None  # инфо об исчерпании лимита (#5): баннер выбора
+    gen: Optional[dict] = None  # live-партиал текущей генерации {stage, idx, text}
 
 
 RUNS: dict[str, Run] = {}
@@ -121,18 +122,29 @@ def _get_run(thread_id: str) -> Run:
     raise HTTPException(404, "run not found")
 
 
-def _bg_op(run: Run, fn) -> dict:
+def _bg_op(run: Run, fn, stage: str | None = None,
+           idx: Optional[int] = None) -> dict:
     """Запускает ручную LLM-операцию В ФОНЕ (LLM долгий — иначе Next-прокси рвёт
     по таймауту → 500). Возвращает сразу; фронт поллит status.
 
+    stage задаёт, КАКОЙ этап перегенерится (для корректного индикатора и live —
+    иначе UI показал бы next-узел графа). Привязывает live-sink в этом потоке,
+    чтобы ревизия стримилась как обычная генерация.
+
     Не ломает позицию графа: по завершении/ошибке возвращаем прежний статус
-    (paused/done), ошибку кладём в run.error (баннер), прогресс в чекпоинте
-    цел — операцию можно повторить кнопкой, граф резюмируем."""
+    (paused/done), ошибку кладём в run.error, прогресс в чекпоинте цел."""
+    from narrative import live  # noqa: PLC0415
     prev = run.status if run.status in ("paused", "done") else "paused"
 
     def _worker():
         run.status = "running"
         run.error = ""
+        if stage:
+            run.gen = {"stage": stage, "idx": idx, "text": ""}
+            def _sink(_stage, _idx, text):  # стрим ревизии во фронт
+                run.gen = {"stage": stage, "idx": idx, "text": text}
+                run.events.put({"type": "gen", "stage": stage, "idx": idx, "text": text})
+            live.bind(_sink, stage, idx)
         run.events.put({"type": "status", "status": "running"})
         try:
             fn()
@@ -149,6 +161,9 @@ def _bg_op(run: Run, fn) -> dict:
             run.status = prev
             run.events.put({"type": "status", "status": prev,
                             "error": run.error})
+        finally:
+            live.clear()
+            run.gen = None
 
     run.worker = threading.Thread(target=_worker, daemon=True)
     run.worker.start()
@@ -178,7 +193,11 @@ def _run_worker(run: Run, _graph_unused, stream_input):
     """Гоняем step-граф (interrupt после каждой стадии) в ЦИКЛЕ. На каждой
     паузе-точке смотрим run.step_mode: ON → стоп и ждём resume; OFF → сами
     продолжаем. Так тумблер пошагового режима работает НА ЛЕТУ."""
-    cfg = _config(run.thread_id)
+    # live-стрим: узлы графа шлют нарастающий текст сюда → во фронт (poll/SSE)
+    def _on_delta(stage, idx, text):
+        run.gen = {"stage": stage, "idx": idx, "text": text}
+        run.events.put({"type": "gen", "stage": stage, "idx": idx, "text": text})
+    cfg = {"configurable": {"thread_id": run.thread_id, "on_delta": _on_delta}}
     graph = _GRAPH_STEP
     run.status = "running"
     run.error = ""  # новый прогон → чистим прошлую ошибку
@@ -187,12 +206,14 @@ def _run_worker(run: Run, _graph_unused, stream_input):
     try:
         while True:
             for event in graph.stream(inp, cfg, stream_mode="values"):
+                run.gen = None  # узел завершился → артефакт в state, гасим партиал
                 log = event.get("log", [])
                 for line in log[run.printed:]:
                     run.events.put({"type": "log", "line": line})
                 run.printed = len(log)
                 run.events.put({"type": "state", "state": _serialize(event)})
 
+            run.gen = None
             snap = graph.get_state(cfg)
             if not snap.next:  # END
                 run.status = "done"
@@ -205,6 +226,7 @@ def _run_worker(run: Run, _graph_unused, stream_input):
                 return
             inp = None  # авто-режим → продолжаем со следующей стадии
     except LLMLimitError as exc:  # #5: лимит провайдера исчерпан → спросить юзера
+        run.gen = None
         limit = {"provider": exc.provider, "reset_at": exc.reset_at,
                  "kind": exc.kind, "message": str(exc)[:200]}
         run.limit = limit
@@ -215,6 +237,7 @@ def _run_worker(run: Run, _graph_unused, stream_input):
             pass
         run.events.put({"type": "status", "status": "limit", "limit": limit})
     except Exception as exc:  # noqa: BLE001
+        run.gen = None
         run.status = "error"
         run.error = str(exc)
         run.events.put({"type": "status", "status": "error", "error": str(exc)})
@@ -301,7 +324,7 @@ def get_state(thread_id: str):
     run = _get_run(thread_id)
     snap = _graph(run).get_state(_config(thread_id))
     return {"status": run.status, "next": list(snap.next),
-            "error": run.error, "limit": run.limit,
+            "error": run.error, "limit": run.limit, "gen": run.gen,
             "state": _serialize(snap.values or {})}
 
 
@@ -476,7 +499,7 @@ def revise_stage(thread_id: str, stage: str, req: ReviseReq):
         _patch(thread_id, run, result)
         run.events.put({"type": "edited", "keys": list(result.keys())})
 
-    return _bg_op(run, _op)
+    return _bg_op(run, _op, stage=stage, idx=req.chapter_idx)
 
 
 # ---------- правка плана конкретной главы (структура) ----------
@@ -645,7 +668,8 @@ def restructure(thread_id: str, req: CountReq):
 
 
 class AddChapterReq(BaseModel):
-    after_idx: int = -1   # вставить ПОСЛЕ этого индекса; -1 → в начало
+    after_idx: int = -1     # вставить ПОСЛЕ этого индекса; -1 → в начало
+    is_adult: bool = True   # адалт-глава (по умолчанию да) или обычная
 
 
 @app.post("/api/runs/{thread_id}/chapter/add")
@@ -659,6 +683,9 @@ def add_chapter(thread_id: str, req: AddChapterReq):
         chapters = list(st.get("chapters") or [])
         after = max(-1, min(req.after_idx, len(chapters) - 1))
         new_ch = nodes.gen_inserted_chapter(st, after)
+        new_ch.is_adult_point = req.is_adult  # адалт/неадалт по выбору юзера
+        if not req.is_adult:
+            new_ch.adult_note = ""
         chapters.insert(after + 1, new_ch)
         for i, ch in enumerate(chapters):
             ch.index = i

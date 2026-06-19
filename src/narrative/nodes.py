@@ -9,7 +9,7 @@ import hashlib
 import os
 from functools import lru_cache
 
-from . import prompts
+from . import live, prompts
 from .config import adult_provider, editor_provider, structural_provider
 from .llm import LLM
 from .routing import retry_key
@@ -97,6 +97,28 @@ def _llm_for(model: str | None):
 _MAX_CHAPTERS = 20  # хард-кап общего числа глав (страховка авто-петли структуры)
 
 
+def _stream_node(stage: str):
+    """Декоратор: привязывает live-sink (из config графа) на время работы узла,
+    чтобы LLM стримил нарастающий текст во фронт. Прямой вызов (revise из сервера)
+    идёт без config → sink None → обычная генерация без стрима."""
+    def deco(fn):
+        def wrapped(state: State, config=None) -> dict:
+            sink = live.sink_from_config(config)
+            if sink is None:
+                # прямой вызов (revise из сервера): НЕ трогаем уже привязанный
+                # live — его мог выставить _bg_op, чтобы стримить ревизию.
+                return fn(state)
+            idx = state.get("chapter_idx") if stage == "dialogue" else None
+            live.bind(sink, stage, idx)
+            try:
+                return fn(state)
+            finally:
+                live.clear()
+        wrapped.__name__ = fn.__name__
+        return wrapped
+    return deco
+
+
 def _genre(state: State) -> str | None:
     return state.get("genre")
 
@@ -118,6 +140,7 @@ def _loc_block(state: State) -> str:
 
 # ---------- Боты 1-4: линейная часть ----------
 
+@_stream_node("logline")
 def logline_node(state: State) -> dict:
     fb = state.get("revision_feedback") or ""
     user = f"Тема и референсы:\n{state['theme']}"
@@ -138,6 +161,7 @@ def logline_node(state: State) -> dict:
     }
 
 
+@_stream_node("synopsis")
 def synopsis_node(state: State) -> dict:
     chosen = state.get("selected_logline") or state.get("logline", "")
     fb = state.get("revision_feedback") or ""
@@ -155,6 +179,7 @@ def synopsis_node(state: State) -> dict:
     }
 
 
+@_stream_node("characters")
 def characters_node(state: State) -> dict:
     fb = state.get("revision_feedback") or ""
     user = f"Синопсис:\n{state['synopsis']}"
@@ -171,6 +196,7 @@ def characters_node(state: State) -> dict:
     }
 
 
+@_stream_node("locations")
 def locations_node(state: State) -> dict:
     """Бот локаций — карточки мест действия (канон локаций), как персонажи.
 
@@ -228,12 +254,14 @@ def _gen_chapter_batch(state: State, start: int, n: int) -> tuple[list[Chapter],
     overflow = len(full) > n
     full = full[:n]
     new = []
-    for i, (title, plan_text, is_adult, note) in enumerate(full):
-        if is_adult and note:  # подсказку «кто с кем» кладём в план — её увидит Бот 6
+    for i, (title, plan_text, _is_adult, note) in enumerate(full):
+        # Адалт — в КАЖДОЙ главе (по умолчанию). Решение бота игнорим; пару
+        # подсказывает adult_note. Вручную главу можно сделать неадалт в UI.
+        if note:  # подсказку «кто с кем» кладём в план — её увидит Бот 6
             plan_text = f"{plan_text}\n\n[Адалт-точка: {note}]"
         new.append(Chapter(
             index=start + i, title=title, plan=plan_text,
-            is_adult_point=is_adult, adult_note=note or "",
+            is_adult_point=True, adult_note=note or "",
         ))
     # done только если НЕ обрезали и (модель сказала «конец» ИЛИ дала меньше N).
     done = (not overflow) and (story_complete or len(new) < n)
@@ -369,12 +397,12 @@ def _gen_full_structure(state: State, target: int) -> list[Chapter]:
         full = [(c.title, c.plan, True, "") for c in parse_chapters(out)]
 
     chapters: list[Chapter] = []
-    for i, (title, plan_text, is_adult, note) in enumerate(full):
-        if is_adult and note:
+    for i, (title, plan_text, _is_adult, note) in enumerate(full):
+        if note:  # адалт в каждой главе (по умолчанию)
             plan_text = f"{plan_text}\n\n[Адалт-точка: {note}]"
         chapters.append(Chapter(
             index=i, title=title, plan=plan_text,
-            is_adult_point=is_adult, adult_note=note or "",
+            is_adult_point=True, adult_note=note or "",
         ))
     return chapters
 
@@ -606,6 +634,7 @@ def sync_plan_from_dialogue(state: State, ch: Chapter, idx: int) -> str:
         _sys(state, prompts.STRUCTURE, names=True), user)
 
 
+@_stream_node("dialogue")
 def dialogue_node(state: State) -> dict:
     idx = state["chapter_idx"]
     chapters = list(state["chapters"])
