@@ -25,7 +25,6 @@ import {
   restructure,
   addChapter,
   deleteChapter,
-  setStageProvider,
   resolveLimit,
   RunSummary,
   listRuns,
@@ -658,13 +657,6 @@ export default function Page() {
               </div>
             )}
 
-            <StageProviderPanel
-              threadId={threadId}
-              providers={st.stage_providers ?? {}}
-              forceOR={!!st.force_openrouter}
-              disabled={busy}
-              onChanged={refresh}
-            />
 
             <h2 className="section">Лента событий</h2>
             <div className="feed">
@@ -858,66 +850,6 @@ export default function Page() {
   );
 }
 
-// #5: выбор провайдера (подписка Claude / OpenRouter) на каждый этап
-function StageProviderPanel({
-  threadId, providers, forceOR, onChanged, disabled,
-}: {
-  threadId: string; providers: Record<string, string>; forceOR: boolean;
-  onChanged: () => void; disabled?: boolean;
-}) {
-  const [open, setOpen] = useState(false);
-  const ROWS: [string, string][] = [
-    ["logline", "Логлайн"], ["synopsis", "Синопсис"], ["characters", "Персонажи"],
-    ["locations", "Локации"], ["chapter_count", "Объём"], ["structure", "Структура"],
-    ["structure_editor", "Ред. структуры"], ["dialogue", "Диалоги (текст главы)"],
-    ["editor", "Редактор"], ["translation", "Перевод"], ["chat", "Чат"],
-  ];
-  async function set(stage: string, v: string) {
-    await setStageProvider(threadId, stage, v); onChanged();
-  }
-  return (
-    <div className="subpanel">
-      <div className="sp-head" style={{ cursor: "pointer" }} onClick={() => setOpen((o) => !o)}>
-        <span>Провайдер по этапам</span>
-        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-      </div>
-      {forceOR && <div className="sp-hint">Сейчас весь ран на OpenRouter (фолбэк лимита).</div>}
-      {open && (
-        <div className="provrows">
-          <div className="sp-hint">
-            Подписка Claude (дёшево) или OpenRouter (платно) — на каждый этап.
-            «по умолч.» = глобальный тумблер выше.
-          </div>
-          <div className="sp-hint" style={{ color: "var(--brick-soft)" }}>
-            🔞 Адалт-главу ЦЕЛИКОМ пишет OpenRouter grok (без цензуры) — подписка
-            Claude её не напишет. Настройка «Диалоги» влияет только на НЕ-адалт главы.
-          </div>
-          <div className="provrow allrow">
-            <span>Все этапы</span>
-            <select disabled={disabled} value=""
-              onChange={(e) => e.target.value && set("all", e.target.value)}>
-              <option value="">задать все…</option>
-              <option value="subscription">подписка</option>
-              <option value="openrouter">OpenRouter</option>
-              <option value="default">по умолч.</option>
-            </select>
-          </div>
-          {ROWS.map(([k, label]) => (
-            <div className="provrow" key={k}>
-              <span>{label}</span>
-              <select disabled={disabled} value={providers[k] || "default"}
-                onChange={(e) => set(k, e.target.value)}>
-                <option value="default">по умолч.</option>
-                <option value="subscription">подписка</option>
-                <option value="openrouter">OpenRouter</option>
-              </select>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
 
 // блок-плейсхолдер «ИИ пишет…»: скелет + спиннер, на месте будущего артефакта.
 // Появляется, пока этап генерится; превращается в обычный блок по готовности.
@@ -1161,11 +1093,15 @@ function Chapters(props: {
 
             {/* #7: адалт-тоггл · вставить после (адалт/без) · удалить */}
             <div className="chap-ops">
-              <button className={`xs ${c.is_adult_point ? "" : "ghost"}`} disabled={props.busy}
-                onClick={() => toggleAdult(c)}
-                title="Сделать главу адалт / неадалт">
-                🔞 адалт: {c.is_adult_point ? "вкл" : "выкл"}
-              </button>
+              {/* тоггл адалта имеет смысл ТОЛЬКО до написания главы (потом
+                  адалт уже в тексте — переключать нечего) */}
+              {c.dialogue == null && (
+                <button className={`xs ${c.is_adult_point ? "" : "ghost"}`} disabled={props.busy}
+                  onClick={() => toggleAdult(c)}
+                  title="До написания: сделать главу адалт / неадалт">
+                  🔞 адалт: {c.is_adult_point ? "вкл" : "выкл"}
+                </button>
+              )}
               <button className="xs ghost" disabled={props.busy}
                 onClick={() => props.onAddChapter(c.index, true)}
                 title="ИИ вставит адалт-главу после этой">
