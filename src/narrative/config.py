@@ -27,7 +27,10 @@ def structural_provider() -> ProviderConfig:
         api_key=_env("OPENROUTER_API_KEY"),
         model=_env("CLAUDE_MODEL", "anthropic/claude-sonnet-4.6"),
         temperature=float(_env("STRUCTURAL_TEMPERATURE", "0.7")),
-        max_tokens=int(_env("STRUCTURAL_MAX_TOKENS", "2048")),
+        # 0 = без лимита. Главы пишутся на ~3500 слов итеративно — жёсткий cap
+        # 2048 токенов (~1500 слов) резал главу на «обрывки». Короткие боты
+        # (логлайн/синопсис) и так не упираются в потолок.
+        max_tokens=int(_env("STRUCTURAL_MAX_TOKENS", "0")),
     )
 
 
@@ -59,3 +62,9 @@ def adult_provider() -> ProviderConfig:
 
 # Сколько раз бот пытается исправить замечание редактора до эскалации человеку.
 MAX_REVISIONS: int = int(_env("MAX_REVISIONS", "4"))
+
+# Объём главы (слова): дефолт ~3500 (6 глав ≈ 20к слов). Можно переопределить
+# на каждую главу в UI. Главы пишутся ИТЕРАТИВНО — несколько подходов с
+# «продолжи с места обрыва», пока не наберём объём (борьба с обрывками).
+CHAPTER_WORDS_DEFAULT: int = int(_env("CHAPTER_WORDS_DEFAULT", "3600"))
+CHAPTER_MAX_PASSES: int = int(_env("CHAPTER_MAX_PASSES", "5"))

@@ -40,3 +40,6 @@ web/tsconfig.tsbuildinfo
 .agents/
 .claude/
 skills-lock.json
+
+# тестовый артефакт генерации главы
+test_chapter.txt

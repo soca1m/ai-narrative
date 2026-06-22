@@ -25,6 +25,9 @@ import {
   restructure,
   addChapter,
   deleteChapter,
+  setChapterWords,
+  expandChapter,
+  expandStage,
   resolveLimit,
   RunSummary,
   listRuns,
@@ -120,6 +123,11 @@ function cleanLive(t: string): string {
   const tail = s.search(/","(statics|anims)"/);
   if (tail >= 0) s = s.slice(0, tail);
   return s.replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\t/g, "  ").replace(/\\\\/g, "\\");
+}
+
+function wordCount(s: string | null | undefined): number {
+  const t = (s ?? "").trim();
+  return t ? t.split(/\s+/).length : 0;
 }
 
 type Ev = { i: number; kind: string; bot: number; chapter: number | null; text: string };
@@ -343,6 +351,21 @@ export default function Page() {
       setErr(null);
       await deleteChapter(threadId, idx); refresh();
     } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось удалить главу"); }
+  }
+  async function onSetWords(idx: number, words: number) {
+    if (!threadId) return;
+    try {
+      setErr(null);
+      await setChapterWords(threadId, idx, words); refresh();
+    } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось задать объём"); }
+  }
+  async function onExpandChapter(idx: number) {
+    if (!threadId) return;
+    try {
+      setErr(null);
+      await expandChapter(threadId, idx);
+      setStatus("running"); poll(threadId);
+    } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось растянуть главу"); }
   }
 
   // #5: решение по исчерпанному лимиту провайдера
@@ -781,6 +804,8 @@ export default function Page() {
             <Chapters
               onAddChapter={onAddChapter}
               onDeleteChapter={onDeleteChapter}
+              onSetWords={onSetWords}
+              onExpandChapter={onExpandChapter}
               threadId={threadId}
               phase={st.phase}
               activeIdx={curIdx}
@@ -811,6 +836,7 @@ export default function Page() {
               value={drafts.locations ?? ""} dirty={dirty.has("locations")} saved={saved === "locations"}
               onChange={(v) => edit("locations", v)} onSave={() => save("locations")}
               onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "locations", fb); refresh(); } })}
+              onExpand={() => guard(async () => { if (threadId) { await expandStage(threadId, "locations"); refresh(); } })}
               onRollback={currentStage === "locations" ? () => guard(async () => { if (threadId && confirm("Откатить этап локаций: удалить карточки локаций и сгенерировать заново?")) { await rollback(threadId, "locations"); refresh(); } }) : undefined}
             />
 
@@ -821,6 +847,7 @@ export default function Page() {
               value={drafts.characters ?? ""} dirty={dirty.has("characters")} saved={saved === "characters"}
               onChange={(v) => edit("characters", v)} onSave={() => save("characters")}
               onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "characters", fb); refresh(); } })}
+              onExpand={() => guard(async () => { if (threadId) { await expandStage(threadId, "characters"); refresh(); } })}
               onRollback={currentStage === "characters" ? () => guard(async () => { if (threadId && confirm("Откатить этап персонажей: удалить карточки и сгенерировать заново?")) { await rollback(threadId, "characters"); refresh(); } }) : undefined}
             />
 
@@ -831,6 +858,7 @@ export default function Page() {
               value={drafts.synopsis ?? ""} dirty={dirty.has("synopsis")} saved={saved === "synopsis"}
               onChange={(v) => edit("synopsis", v)} onSave={() => save("synopsis")}
               onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "synopsis", fb); refresh(); } })}
+              onExpand={() => guard(async () => { if (threadId) { await expandStage(threadId, "synopsis"); refresh(); } })}
               onRollback={currentStage === "synopsis" ? () => guard(async () => { if (threadId && confirm("Откатить этап синопсиса: удалить синопсис и сгенерировать заново?")) { await rollback(threadId, "synopsis"); refresh(); } }) : undefined}
             />
 
@@ -934,6 +962,7 @@ function EditableCard(props: {
   value: string; dirty: boolean; saved: boolean;
   onChange: (v: string) => void; onSave: () => void;
   onRevise: (fb: string) => Promise<void>; onRollback?: () => Promise<void>;
+  onExpand?: () => Promise<void>;
 }) {
   if (!props.value && !props.dirty) return null;
   return (
@@ -943,6 +972,10 @@ function EditableCard(props: {
         <span className="row">
           {props.saved && <span className="saved"><Check size={13} /> сохранено</span>}
           <button className="small" disabled={!props.dirty || props.busy} onClick={props.onSave}>Сохранить</button>
+          {props.onExpand && (
+            <button className="small ghost" disabled={props.busy} onClick={props.onExpand}
+              title="Растянуть: сделать текст подробнее, сохранив суть"><ArrowRight size={14} /> Растянуть</button>
+          )}
           {props.onRollback && (
             <button className="small ghost" disabled={props.busy} onClick={props.onRollback}
               title="Удалить результат этого этапа и сгенерировать заново"><Undo2 size={14} /> Откат</button>
@@ -975,6 +1008,8 @@ function Chapters(props: {
   onSkipAdult: (i: number) => Promise<void>;
   onAddChapter: (after: number, isAdult?: boolean) => Promise<void>;
   onDeleteChapter: (idx: number) => Promise<void>;
+  onSetWords: (idx: number, words: number) => Promise<void>;
+  onExpandChapter: (idx: number) => Promise<void>;
 }) {
   // overrides-модель: рендерим из серверных props.chapters, локально храним
   // ТОЛЬКО изменённые поля (ключ `${index}.${field}`). Поэтому новые главы/
@@ -984,6 +1019,7 @@ function Chapters(props: {
   const [adapting, setAdapting] = useState<number | null>(null);
   const [working, setWorking] = useState<string | null>(null);
   const [toggled, setToggled] = useState<Record<number, boolean>>({});
+  const [hlOn, setHlOn] = useState<Record<number, boolean>>({});  // подсветка замечаний
   const dirty = Object.keys(edits).length > 0;
   if (!props.chapters.length) return null;
 
@@ -1041,9 +1077,12 @@ function Chapters(props: {
   function rounds(idx: number) {
     return props.reports.filter((r) => r.chapter_index === idx);
   }
-  function pick(id: string) {
+  function pick(id: string, chIdx?: number) {
     setActiveFinding(id);
-    document.getElementById(`mark-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    // клик по замечанию → включаем подсветку этой главы, затем скроллим к месту
+    if (chIdx != null) setHlOn((s) => ({ ...s, [chIdx]: true }));
+    setTimeout(() => document.getElementById(`mark-${id}`)
+      ?.scrollIntoView({ behavior: "smooth", block: "center" }), 60);
   }
 
   return (
@@ -1117,6 +1156,28 @@ function Chapters(props: {
                 title="Удалить эту главу">
                 <X size={12} /> удалить
               </button>
+              <span className="cw-sep" />
+              <span className="cw-words" title="Цель по словам для этой главы (пусто = дефолт 3600)">
+                слов:
+                <input type="number" min={0} step={250} placeholder="3600"
+                  defaultValue={c.target_words ?? ""}
+                  disabled={props.busy}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") props.onSetWords(c.index, +(e.target as HTMLInputElement).value || 0);
+                  }}
+                  onBlur={(e) => { const v = +e.target.value || 0; if ((c.target_words ?? 0) !== v) props.onSetWords(c.index, v); }} />
+                сл.
+              </span>
+              {c.dialogue != null && (
+                <span className="cw-count" title="Текущий объём главы">≈{wordCount(c.dialogue)} сл.</span>
+              )}
+              {c.dialogue != null && (
+                <button className="xs ghost" disabled={props.busy}
+                  onClick={() => props.onExpandChapter(c.index)}
+                  title="Растянуть: сделать главу подробнее (~+800 слов)">
+                  <ArrowRight size={12} /> растянуть
+                </button>
+              )}
             </div>
 
             {/* пре-чек адалта: главе не из чего генерить сцену */}
@@ -1176,7 +1237,7 @@ function Chapters(props: {
                     {r.findings.map((f) => (
                       <FindingRow key={f.id} f={f} active={activeFinding === f.id}
                         disabled={props.busy}
-                        onPick={() => pick(f.id)} onDecide={props.onDecide} />
+                        onPick={() => pick(f.id, i)} onDecide={props.onDecide} />
                     ))}
                   </div>
                 ))}
@@ -1213,10 +1274,25 @@ function Chapters(props: {
               </div>
             )}
 
-            {c.dialogue != null && (<>
+            {c.dialogue != null && (() => {
+              const dtext = val(i, "dialogue", c.dialogue);
+              const hasQ = allFindings.some((f) => f.quote && dtext.includes(f.quote));
+              return (<>
               <label>Диалоги + адалт · Бот 05</label>
-              <Highlighted text={val(i, "dialogue", c.dialogue)} findings={allFindings} active={activeFinding} onPick={pick} />
-              <textarea rows={12} value={val(i, "dialogue", c.dialogue)} onChange={(e) => upd(i, "dialogue", e.target.value)} />
+              {hasQ && (
+                <button className="xs ghost" disabled={props.busy}
+                  onClick={() => setHlOn((s) => ({ ...s, [i]: !s[i] }))}
+                  title="Подсветить жёлтым места из замечаний редактора / вернуться к правке">
+                  {hlOn[i]
+                    ? <><Wand2 size={13} /> Редактировать текст</>
+                    : <><ScanSearch size={13} /> Подсветить замечания</>}
+                </button>
+              )}
+              {hasQ && hlOn[i] ? (
+                <Highlighted text={dtext} findings={allFindings} active={activeFinding} onPick={(id) => pick(id, i)} />
+              ) : (
+                <textarea rows={12} value={dtext} onChange={(e) => upd(i, "dialogue", e.target.value)} />
+              )}
               <button className="small ghost" disabled={working === `sp${i}` || props.busy}
                 title="Сохранить текст и подогнать план главы под написанное"
                 onClick={() => withWork(`sp${i}`, () => props.onSyncPlan(i))}>
@@ -1224,10 +1300,9 @@ function Chapters(props: {
                   ? <><Loader2 size={14} className="spin" /> Синхронизирую…</>
                   : <><RefreshCw size={14} /> Диалоги → обновить план</>}
               </button>
-            </>)}
+            </>); })()}
             {c.adult_scene != null && (<>
               <label className="adult">Адалт-сцена · Бот 06</label>
-              <Highlighted text={val(i, "adult_scene", c.adult_scene)} findings={allFindings} active={activeFinding} onPick={pick} />
               <textarea rows={10} value={val(i, "adult_scene", c.adult_scene)} onChange={(e) => upd(i, "adult_scene", e.target.value)} />
             </>)}
             {c.translation != null && (<>

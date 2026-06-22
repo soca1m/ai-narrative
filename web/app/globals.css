@@ -342,12 +342,11 @@ button.alt { background: var(--gold); }
   padding: 10px 12px; margin: 4px 0 6px; font-size: 12.5px; line-height: 1.7;
   white-space: pre-wrap; max-height: 240px; overflow-y: auto;
 }
-mark.hl { border-radius: 3px; padding: 0 2px; cursor: pointer; color: var(--paper); background: rgba(214,169,78,0.28); transition: background 0.2s, box-shadow 0.2s; }
-mark.hl.critical { background: rgba(207,91,74,0.32); }
-mark.hl.important { background: rgba(214,169,78,0.30); }
-mark.hl.minor { background: rgba(125,113,89,0.30); }
-mark.hl.rejected { background: rgba(125,113,89,0.18); text-decoration: line-through; opacity: 0.6; }
-mark.hl.on { box-shadow: 0 0 0 2px var(--ember); background: rgba(232,132,58,0.4); }
+/* подсветка проблемных мест — жёлтым (все severity одинаково жёлтые) */
+mark.hl { border-radius: 3px; padding: 0 2px; cursor: pointer; color: #1a1206; background: rgba(240,208,70,0.45); transition: background 0.2s, box-shadow 0.2s; }
+mark.hl.critical, mark.hl.important, mark.hl.minor { background: rgba(240,208,70,0.45); }
+mark.hl.rejected { background: rgba(125,113,89,0.18); color: var(--paper); text-decoration: line-through; opacity: 0.6; }
+mark.hl.on { box-shadow: 0 0 0 2px #f0d046; background: rgba(240,208,70,0.9); }
 
 /* ---------- finding: действия ---------- */
 .finding.active { box-shadow: 0 0 0 2px var(--ember); }
@@ -637,3 +636,9 @@ button:disabled.xs { opacity: 0.7; }
 .sp-usage { margin-top: 6px; font-size: 11px; color: var(--muted); line-height: 1.5; }
 .sp-usage.warn { color: var(--gold); }
 .sp-usage.rej { color: var(--brick); }
+
+/* объём главы: цель/счётчик слов в chap-ops */
+.cw-sep { flex: 1; }
+.cw-words { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
+.cw-words input { width: 70px; padding: 3px 6px; font-size: 11px; }
+.cw-count { font-size: 11px; color: var(--ember-soft); font-weight: 600; }

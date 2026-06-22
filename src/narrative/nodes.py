@@ -7,16 +7,19 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from functools import lru_cache
 
 from . import live, prompts
-from .config import adult_provider, editor_provider, structural_provider
+from .config import (CHAPTER_MAX_PASSES, CHAPTER_WORDS_DEFAULT, adult_provider,
+                     editor_provider, structural_provider)
 from .llm import LLM, LLMLimitError
 from .routing import retry_key
 from .state import (
     AdultFeasibility,
     AdultSceneOut,
     Chapter,
+    StaticShot,
     ChapterCountOut,
     DialogueOut,
     EditorReport,
@@ -496,66 +499,240 @@ def structure_editor_node(state: State) -> dict:
 
 # ---------- Боты 5-6-7: поглавный цикл ----------
 
+def _word_count(text: str | None) -> int:
+    return len((text or "").split())
+
+
+def _looks_truncated(text: str | None) -> bool:
+    """Грубый детект обрыва: пусто, висит на полуслове, или «продолжение»."""
+    t = (text or "").rstrip()
+    if not t:
+        return True
+    low = t.lower()
+    if any(m in low[-200:] for m in ("продолжение следует", "[конец части",
+                                     "to be continued")):
+        return True
+    return t[-1] not in '.!?»"”*…)>'
+
+
+# Маркеры завершённой главы — чтобы НЕ запускать лишний проход добора (он
+# переписывает концовку заново → дубли). Главу в формате ВН закрывает «ВЫБОР
+# ИГРОКА».
+_DONE_MARKERS = ("выбор игрока", "глава завершена", "конец главы")
+
+
+def _looks_complete(text: str | None) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _DONE_MARKERS)
+
+
+# Хвостовая мета-болтовня модели (вне художественного текста) — срезаем.
+_META_SUB = (
+    "жди следующую", "жду главу", "жду следующую", "готов. присылай",
+    "присылай сценарн", "присылай план", "глава завершена", "показанный текст",
+    "структура бита", "— закрыта", "принята. финал", "принята — финал",
+    "глава 01 принята", "глава 02", "следующую главу из плана",
+)
+
+
+def _strip_trailing_meta(text: str) -> str:
+    """Снять хвостовые строки с мета-комментариями модели (не часть главы)."""
+    lines = (text or "").rstrip().split("\n")
+    while lines:
+        low = lines[-1].strip().lower().strip("*# ")
+        if not low:
+            lines.pop()
+            continue
+        if any(m in low for m in _META_SUB):
+            lines.pop()
+            continue
+        break
+    return "\n".join(lines).rstrip()
+
+
+def _target_words(state: State, ch: Chapter) -> int:
+    return int(ch.target_words or state.get("default_words")
+               or CHAPTER_WORDS_DEFAULT)
+
+
+_SHOT_RE = re.compile(
+    r"^\s*(\d{2}-[A-Za-z][A-Za-z0-9]*?(Anim)?-\d+)\s*[—:\-]\s*(.+?)\s*$",
+    re.MULTILINE)
+
+
+def _extract_shots(text: str) -> tuple[list[StaticShot], list[StaticShot]]:
+    """Парсит теги кадров из текста главы → (статики, анимации) для художника."""
+    statics: list[StaticShot] = []
+    anims: list[StaticShot] = []
+    for m in _SHOT_RE.finditer(text or ""):
+        shot = StaticShot(tag=m.group(1), description=m.group(3))
+        (anims if m.group(2) else statics).append(shot)
+    return statics, anims
+
+
+def _gen_until_words(llm, system: str, user: str, target: int,
+                     max_passes: int) -> str:
+    """Пишет текст ИТЕРАТИВНО: первый проход + «продолжи с обрыва», пока не
+    наберём ~target слов и текст не завершён (борьба с обрывками/кусками)."""
+    text = _strip_trailing_meta(llm.complete(system, user))
+    passes = 1
+    # добор ТОЛЬКО пока глава НЕ завершена и (оборвана или сильно коротка).
+    # завершённую (есть «ВЫБОР ИГРОКА») не трогаем — иначе модель переписывает
+    # концовку заново и плодит дубли.
+    while passes < max_passes and not _looks_complete(text) and (
+            _looks_truncated(text) or _word_count(text) < int(target * 0.85)):
+        tail = (text or "")[-1500:]
+        cont = _strip_trailing_meta(llm.complete(
+            system,
+            user + prompts.CHAPTER_CONTINUE_GUIDE.format(
+                marker=prompts.ADULT_MARKER, tail=tail)))
+        if not cont.strip():
+            break
+        text = (text or "").rstrip() + "\n\n" + cont.lstrip()
+        passes += 1
+    return text
+
+
+def _expand_to_target(llm, system: str, ctx: str, text: str, target: int,
+                      max_passes: int, keep_marker: bool = False) -> str:
+    """Добивает объём РАСШИРЕНИЕМ НА МЕСТЕ (переписать подробнее, не дописывать),
+    когда глава уже завершена, но короче цели. Без дублей: это полная
+    обогащённая версия, а не приклеенный хвост."""
+    passes = 0
+    while passes < max_passes and _word_count(text) < int(target * 0.85):
+        add = max(300, target - _word_count(text))
+        eu = (ctx + f"\n\nТЕКУЩИЙ ТЕКСТ ГЛАВЫ:\n{text}"
+              + prompts.EXPAND_GUIDE.format(add=add))
+        if keep_marker:
+            eu += (f"\n\nВАЖНО: сохрани строку-метку {prompts.ADULT_MARKER} "
+                   "ровно один раз на её месте, НЕ раскрывай саму сцену.")
+        new = _strip_trailing_meta(llm.complete(system, eu))
+        if _word_count(new) <= _word_count(text) + 50:
+            break  # модель не растит — выходим, чтобы не крутиться впустую
+        text = new
+        passes += 1
+    return text
+
+
+_BRACE_TAG = re.compile(
+    r"\{\s*(\d{2}-[A-Za-z][A-Za-z0-9]*(?:Anim)?-\d+)\s*\}")
+
+
+def _normalize_tags(text: str) -> str:
+    """Снять фигурные скобки вокруг тегов кадров (грок иногда копирует {NN}-…
+    из примера) — иначе парсер статиков их не видит, и формат расходится с
+    тегами Claude."""
+    return _BRACE_TAG.sub(r"\1", text or "")
+
+
+def _insert_adult(state: State, ch: Chapter, idx: int, full: str,
+                  words: int) -> str:
+    """Грок заполняет метку ADULT_MARKER откровенной сценой.
+
+    Грок получает контекст «до»/«после» метки и пишет ТОЛЬКО сцену между ними —
+    без послесловия/перехода (его уже написал Claude после метки) → нет дублей.
+    """
+    if prompts.ADULT_MARKER not in full:
+        # Claude не поставил метку → ставим перед последним абзацем-финалом.
+        full = full.rstrip() + "\n\n" + prompts.ADULT_MARKER
+    head, _, tail = full.partition(prompts.ADULT_MARKER)
+    before = head.rstrip()[-2500:]          # подводка вплотную к сцене
+    after = tail.lstrip()[:1800]            # что идёт ПОСЛЕ — не повторять
+    pair = ch.adult_note or "см. карточки персонажей"
+    system = _sys(state, prompts.ADULT, names=True)
+    user = (
+        prompts.ADULT_INSERT.format(
+            note=pair, nn=f"{idx + 1:02d}", words=words,
+            before=before, after=after)
+        + prompts.ADULT_CANON_GUARD.format(pair=pair))
+    try:
+        scene = _adult().complete(system, user)
+    except LLMLimitError:
+        raise
+    except Exception:
+        scene = ""
+    if not scene.strip() or _looks_like_refusal(scene):
+        ch.adult_block_reason = ("Адалт-сцена не сгенерирована — повтори правку "
+                                 "или допиши вручную")
+        return full.replace(prompts.ADULT_MARKER, "").strip()
+    ch.adult_block_reason = None
+    scene = _normalize_tags(scene.strip())
+    # заменяем ТОЛЬКО первую метку, лишние (если модель продублировала) — снимаем
+    out = full.replace(prompts.ADULT_MARKER, scene, 1)
+    return out.replace(prompts.ADULT_MARKER, "").strip()
+
+
 def write_chapter(state: State, ch: Chapter, idx: int,
                   feedback: str = "") -> Chapter:
-    """Пишет текст главы (диалоги + адалт внутри) по её ПЛАНУ.
+    """Пишет ПОЛНУЮ главу по плану (новая схема, #правки):
 
-    Общий код для Бота 5 (нода) и для ручной перегенерации главы из UI
-    (правка плана → переписать диалог). Возвращает обновлённый ch
-    (dialogue/statics/anims). Адалт-глава пишется uncensored-моделью.
+    Claude (structural) пишет всю главу целиком и ИТЕРАТИВНО добивает объём до
+    цели (~target_words) — самодостаточный эпизод, не «кусок». На адалт-главе
+    Claude ставит метку [[ADULT_SCENE]], которую грок заменяет полной
+    откровенной сценой (история — Claude, адалт — грок). Теги кадров парсятся
+    из текста в statics/anims для художника.
     """
-    user = (
+    target = _target_words(state, ch)
+    is_adult = bool(ch.is_adult_point)
+    # на адалт-главе делим бюджет: история (Claude) + сцена (грок)
+    story_target = max(800, int(target * 0.6)) if is_adult else target
+    adult_words = max(500, int(target * 0.4))
+
+    base = (
         f"Карточки персонажей:\n{state['characters']}" + _loc_block(state)
         + f"\n\nНомер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
         f"Глава для написания:\n{ch.title}\n{ch.plan}"
     )
     if feedback:
-        user += f"\n\nТекущий черновик главы:\n{ch.dialogue or ''}\n\n{feedback}"
-    user += (
-        "\n\nВыведи ТОЛЬКО готовый текст этой главы в заданном формате "
-        "визуальной новеллы. Никаких преамбул, вопросов, комментариев и "
-        "пояснений. Если это правка — верни ПОЛНУЮ переписанную главу целиком."
-    )
-    is_adult = bool(ch.is_adult_point)
-    if is_adult:
-        system = (_sys(state, prompts.DIALOGUE, names=True)
-                  + prompts.DIALOGUE_ADULT_EXTRA + prompts.STATICS_ADULT)
-        # #1: канон-гард участников — держит характер, не тонет в карточках
-        user += prompts.ADULT_CANON_GUARD.format(
-            pair=ch.adult_note or "см. карточки персонажей")
-        llm = _adult()
-    else:
-        system = _sys(state, prompts.DIALOGUE, names=True) + prompts.STATICS_DIALOGUE
-        # модель = подписка Claude (если вкл) ИНАЧЕ фоллбек на OpenRouter-ключ
-        llm = _structural(state, "dialogue")
+        base += f"\n\nТекущий черновик главы:\n{ch.dialogue or ''}\n\n{feedback}"
 
-    try:
-        out = llm.structured(system, user, DialogueOut, temperature=0.7)
-        ch.dialogue, ch.statics, ch.anims = out.script, out.statics, out.anims
-    except Exception:
-        # фолбэк на прозу: чистим статики/анимации — иначе остались бы от
-        # прошлого (другого) текста главы и сбили бы художника/UI.
-        ch.dialogue = llm.complete(system, user)
-        ch.statics, ch.anims = [], []
-    ch.adult_scene = None  # адалт теперь внутри ch.dialogue, не вставкой
-    # #4: адалт-сцена вышла короткой → один добор объёма (grok иногда мельчит)
-    if is_adult and _too_short(ch.dialogue):
-        try:
-            out = llm.structured(system, user + prompts.ADULT_EXPAND,
-                                 DialogueOut, temperature=0.7)
-            if out.script and len(out.script) > len(ch.dialogue or ""):
-                ch.dialogue, ch.statics, ch.anims = out.script, out.statics, out.anims
-        except Exception:
-            pass
+    system = _sys(state, prompts.DIALOGUE, names=True) + prompts.STATICS_DIALOGUE
+    user = base + prompts.CHAPTER_FULL_GUIDE.format(
+        words=story_target, min=int(story_target * 0.8))
+    if is_adult:
+        user += prompts.CHAPTER_ADULT_MARKER_GUIDE.format(
+            marker=prompts.ADULT_MARKER,
+            pair=ch.adult_note or "см. карточки персонажей")
+
+    # Историю всегда пишет Claude/structural (не грок) — связный сюжет.
+    llm = _structural(state, "dialogue")
+    full = _gen_until_words(llm, system, user, story_target, CHAPTER_MAX_PASSES)
+    # завершённая, но короткая глава → добиваем объём расширением на месте
+    # (без дублей), пока сцены ещё нет (метка цела)
+    if _word_count(full) < int(story_target * 0.85):
+        # 1 проход расширения: полный перепис Claude-подпиской медленный,
+        # 2+ прохода = десятки минут на главу. 1 даёт ощутимый рост без затрат.
+        full = _expand_to_target(llm, system, base, full, story_target,
+                                 max_passes=1, keep_marker=is_adult)
+
+    if is_adult:
+        full = _insert_adult(state, ch, idx, full, adult_words)
+
+    full = _normalize_tags(_strip_trailing_meta(full))
+    ch.dialogue = full
+    ch.statics, ch.anims = _extract_shots(full)
+    ch.adult_scene = None  # адалт теперь внутри ch.dialogue
     return ch
 
 
-_MIN_ADULT_CHARS = 2500  # порог «слишком короткой» адалт-сцены
-
-
-def _too_short(text: str | None) -> bool:
-    t = text or ""
-    return len(t) < _MIN_ADULT_CHARS or t.count('"') < 24
+def expand_chapter(state: State, ch: Chapter, idx: int,
+                   add_words: int = 800) -> Chapter:
+    """«Растянуть» текст главы: обогатить сцены/диалоги/детали на ~add_words,
+    сохранив события и теги. Адалт-главу растягивает грок (без цензуры)."""
+    is_adult = bool(ch.is_adult_point)
+    statics_block = prompts.STATICS_ADULT if is_adult else prompts.STATICS_DIALOGUE
+    system = _sys(state, prompts.DIALOGUE, names=True) + statics_block
+    user = (
+        f"Карточки персонажей:\n{state['characters']}" + _loc_block(state)
+        + f"\n\nНомер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
+        f"ТЕКУЩИЙ ТЕКСТ ГЛАВЫ «{ch.title}»:\n{ch.dialogue or ''}"
+        + prompts.EXPAND_GUIDE.format(add=add_words))
+    llm = _adult() if is_adult else _structural(state, "dialogue")
+    out = llm.complete(system, user)
+    if out and _word_count(out) > _word_count(ch.dialogue or ""):
+        ch.dialogue = out
+        ch.statics, ch.anims = _extract_shots(out)
+    return ch
 
 
 def _open_findings_for(state: State, idx: int) -> list[Finding]:

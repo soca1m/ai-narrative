@@ -32,6 +32,7 @@ from pydantic import BaseModel
 from narrative import nodes
 from narrative.graph import STAGE_NODES, build_graph, sqlite_saver
 from narrative.llm import LLMLimitError
+from narrative.config import CHAPTER_WORDS_DEFAULT
 from narrative.routing import apply_decisions
 from narrative.state import Chapter, JudgeOut
 
@@ -266,6 +267,7 @@ class StartReq(BaseModel):
     translation_enabled: bool = False  # перевод временно на паузе
     step_mode: bool = True
     chapter_model: Optional[str] = None  # модель для глав (Бот 5, не-адалт)
+    default_words: int = 0               # цель слов/главу (0 → дефолт конфига)
 
 
 class PatchReq(BaseModel):
@@ -312,6 +314,7 @@ def start_run(req: StartReq):
         "chapters_per_batch": max(1, req.chapters_per_batch),
         "translation_enabled": req.translation_enabled,
         "chapter_model": req.chapter_model,
+        "default_words": req.default_words or CHAPTER_WORDS_DEFAULT,
     }
     run.worker = threading.Thread(
         target=_run_worker, args=(run, _graph(run), init), daemon=True)
@@ -722,6 +725,82 @@ def delete_chapter(thread_id: str, idx: int):
     _patch(thread_id, run, patch)
     run.events.put({"type": "edited", "keys": ["chapters"]})
     return {"ok": True, "chapters": len(chapters)}
+
+
+# ---------- объём главы (слова) + «растянуть» ----------
+
+class WordsReq(BaseModel):
+    words: int                # цель слов на главу (0 → дефолт прогона)
+
+
+@app.post("/api/runs/{thread_id}/chapter/{idx}/words")
+def set_chapter_words(thread_id: str, idx: int, req: WordsReq):
+    """Задать целевой объём (слова) для конкретной главы (оверрайд дефолта)."""
+    run = _get_run(thread_id)
+    _busy(run)
+    st = _state(thread_id)
+    chapters = list(st.get("chapters") or [])
+    if idx < 0 or idx >= len(chapters):
+        raise HTTPException(400, "bad chapter index")
+    w = int(req.words)
+    chapters[idx].target_words = w if w > 0 else None
+    _patch(thread_id, run, {"chapters": chapters})
+    run.events.put({"type": "edited", "keys": ["chapters"]})
+    return {"ok": True, "target_words": chapters[idx].target_words}
+
+
+class ExpandReq(BaseModel):
+    add_words: int = 800      # на сколько примерно растянуть
+
+
+@app.post("/api/runs/{thread_id}/chapter/{idx}/expand")
+def expand_chapter_ep(thread_id: str, idx: int, req: ExpandReq):
+    """«Растянуть» текст главы на ~add_words (ФОНОВО — LLM долгий)."""
+    run = _get_run(thread_id)
+    _busy(run)
+    st = _state(thread_id)
+    chapters = list(st.get("chapters") or [])
+    if idx < 0 or idx >= len(chapters):
+        raise HTTPException(400, "bad chapter index")
+
+    def _op():
+        st2 = _state(thread_id)
+        chs = list(st2.get("chapters") or [])
+        ch = nodes.expand_chapter(st2, chs[idx], idx, max(100, req.add_words))
+        chs[idx] = ch
+        _patch(thread_id, run, {"chapters": chs})
+        run.events.put({"type": "edited", "keys": ["chapters"]})
+
+    return _bg_op(run, _op, stage="dialogue", idx=idx)
+
+
+class ExpandStageReq(BaseModel):
+    add_words: int = 400
+
+
+@app.post("/api/runs/{thread_id}/stage/{stage}/expand")
+def expand_stage(thread_id: str, stage: str, req: ExpandStageReq):
+    """«Растянуть» текстовый блок-этап (synopsis/characters/locations)."""
+    run = _get_run(thread_id)
+    _busy(run)
+    if stage not in ("synopsis", "characters", "locations"):
+        raise HTTPException(400, "expand доступен для synopsis/characters/locations")
+
+    def _op():
+        from narrative import prompts  # noqa: PLC0415
+        st2 = _state(thread_id)
+        cur = st2.get(stage) or ""
+        if not cur.strip():
+            return
+        system = nodes._sys(st2, prompts.STRUCTURE, names=True)
+        user = (f"ТЕКУЩИЙ ТЕКСТ:\n{cur}"
+                + prompts.EXPAND_GUIDE.format(add=max(100, req.add_words)))
+        out = nodes._structural(st2, stage).complete(system, user)
+        if out.strip() and len(out) > len(cur):
+            _patch(thread_id, run, {stage: out})
+            run.events.put({"type": "edited", "keys": [stage]})
+
+    return _bg_op(run, _op, stage=stage)
 
 
 # ---------- решения по findings редактора ----------

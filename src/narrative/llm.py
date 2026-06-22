@@ -239,14 +239,20 @@ def _strict_schema(schema: Type[BaseModel]) -> dict:
     return js
 
 
+# Управляющие символы, ломающие json.loads/model_validate_json (кроме \t\n\r).
+# Модель иногда вставляет NUL () и прочее → «Invalid JSON: control char».
+_CTRL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
 def _extract_json(raw: str) -> str:
-    """Достаёт JSON, даже если модель обернула его в ```json-ограждение."""
+    """Достаёт JSON, даже если модель обернула его в ```json-ограждение,
+    и вычищает управляющие символы (иначе валидация падает на \\u0000 и т.п.)."""
     fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", raw, re.DOTALL)
     if fenced:
-        return fenced.group(1)
+        return _CTRL_CHARS.sub("", fenced.group(1))
     # иначе берём от первой { до последней }
     start = raw.find("{")
     end = raw.rfind("}")
     if start != -1 and end > start:
-        return raw[start:end + 1]
-    return raw
+        return _CTRL_CHARS.sub("", raw[start:end + 1])
+    return _CTRL_CHARS.sub("", raw)

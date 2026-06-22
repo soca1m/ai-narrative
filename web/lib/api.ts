@@ -33,6 +33,7 @@ export type Chapter = {
   translation: string | null;
   adult_block_reason: string | null;
   adult_bridge_hint: string | null;
+  target_words?: number | null;
 };
 
 export type NarrativeState = {
@@ -48,6 +49,7 @@ export type NarrativeState = {
   synopsis?: string;
   characters?: string;
   locations?: string;
+  default_words?: number;
   stage_providers?: Record<string, string>;
   force_openrouter?: boolean;
   limit_info?: LimitInfo | null;
@@ -72,7 +74,30 @@ export type StartReq = {
   translation_enabled: boolean;
   step_mode: boolean;
   chapter_model?: string;
+  default_words?: number;   // цель слов/главу (0/пусто → дефолт ~3500)
 };
+
+// Безопасный разбор ответа: не падаем с «Unexpected token» на не-JSON
+// (напр. бэкенд отдал «Internal Server Error» или прокси вернул HTML).
+async function parseJsonSafe<T = any>(r: Response, url: string): Promise<T> {
+  const text = await r.text();
+  let data: any = null;
+  try { data = text ? JSON.parse(text) : null; } catch { /* не JSON */ }
+  if (!r.ok) {
+    const detail = (data && (data.detail?.message || data.detail || data.error))
+      || (text ? text.slice(0, 160) : "");
+    throw new Error(`${url}: ${r.status}${detail ? ` — ${detail}` : ""}`);
+  }
+  if (data === null && text) {
+    throw new Error(`${url}: некорректный ответ сервера (не JSON)`);
+  }
+  return data as T;
+}
+
+async function jget<T = any>(url: string): Promise<T> {
+  const r = await fetch(`${API_BASE}${url}`);
+  return parseJsonSafe<T>(r, url);
+}
 
 async function jpost<T = any>(url: string, body?: unknown): Promise<T> {
   const r = await fetch(`${API_BASE}${url}`, {
@@ -80,8 +105,7 @@ async function jpost<T = any>(url: string, body?: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`${url} failed: ${r.status}`);
-  return r.json();
+  return parseJsonSafe<T>(r, url);
 }
 
 export async function startRun(req: StartReq): Promise<{ thread_id: string }> {
@@ -93,10 +117,7 @@ export type RunSummary = {
   written: number; status: string;
 };
 export const listRuns = (): Promise<{ runs: RunSummary[] }> =>
-  fetch(`${API_BASE}/api/runs`).then((r) => {
-    if (!r.ok) throw new Error(`list runs failed: ${r.status}`);
-    return r.json();
-  });
+  jget("/api/runs");
 
 export type LimitInfo = {
   provider: string; reset_at?: number | null; kind?: string; message?: string;
@@ -108,9 +129,7 @@ export async function getState(
   limit?: LimitInfo | null;
   gen?: { stage: string; idx: number | null; text: string } | null;
   state: NarrativeState }> {
-  const r = await fetch(`${API_BASE}/api/runs/${threadId}/state`);
-  if (!r.ok) throw new Error(`state failed: ${r.status}`);
-  return r.json();
+  return jget(`/api/runs/${threadId}/state`);
 }
 
 export async function patchState(
@@ -156,6 +175,16 @@ export const deleteChapter = (id: string, idx: number) =>
   fetch(`${API_BASE}/api/runs/${id}/chapter/${idx}`, { method: "DELETE" })
     .then((r) => { if (!r.ok) throw new Error(`del failed: ${r.status}`); return r.json(); });
 
+// объём главы (слова): оверрайд цели на конкретную главу (0 → дефолт прогона)
+export const setChapterWords = (id: string, idx: number, words: number) =>
+  jpost(`/api/runs/${id}/chapter/${idx}/words`, { words });
+// «растянуть» главу на ~add_words (ФОНОВО)
+export const expandChapter = (id: string, idx: number, add_words = 800) =>
+  jpost(`/api/runs/${id}/chapter/${idx}/expand`, { add_words });
+// «растянуть» текстовый блок-этап (synopsis/characters/locations)
+export const expandStage = (id: string, stage: string, add_words = 400) =>
+  jpost(`/api/runs/${id}/stage/${stage}/expand`, { add_words });
+
 // #5: провайдер (подписка/OpenRouter) для этапа ("all" → все)
 export const setStageProvider = (id: string, stage: string, provider: string) =>
   jpost(`/api/runs/${id}/stage_provider`, { stage, provider });
@@ -179,7 +208,7 @@ export type ClaudeStatus = {
   expires?: string | null; sub?: string | null; warn?: string;
 };
 export const claudeStatus = (): Promise<ClaudeStatus> =>
-  fetch(`${API_BASE}/api/claude/status`).then((r) => r.json());
+  jget("/api/claude/status");
 
 export type ClaudeRateLimit = {
   status?: "allowed" | "allowed_warning" | "rejected" | null;
@@ -189,14 +218,14 @@ export type ClaudeRateLimit = {
   overage_status?: string | null;
 };
 export const claudeUsage = (): Promise<{ rate_limit: ClaudeRateLimit | null }> =>
-  fetch(`${API_BASE}/api/claude/usage`).then((r) => r.json());
+  jget("/api/claude/usage");
 export const setClaudeSubscription = (enabled: boolean, model?: string): Promise<ClaudeStatus> =>
   jpost("/api/claude/subscription", { enabled, model });
 export const setClaudeToken = (token: string): Promise<ClaudeStatus> =>
   jpost("/api/claude/token", { token });
 // OAuth-подключение подписки из веба: ссылка авторизации + обмен кода на токен
 export const claudeAuthUrl = (): Promise<{ authorized: boolean; url: string | null }> =>
-  fetch(`${API_BASE}/api/claude/auth_url`).then((r) => r.json());
+  jget("/api/claude/auth_url");
 export const claudeExchange = (code: string): Promise<ClaudeStatus> =>
   jpost("/api/claude/exchange", { code });
 
@@ -225,10 +254,7 @@ export const applyRevision = (
 export const exportProject = (
   id: string, fmt: "txt" | "md" = "txt",
 ): Promise<{ filename: string; text: string; chapters: number }> =>
-  fetch(`${API_BASE}/api/runs/${id}/export?fmt=${fmt}`).then((r) => {
-    if (!r.ok) throw new Error(`export failed: ${r.status}`);
-    return r.json();
-  });
+  jget(`/api/runs/${id}/export?fmt=${fmt}`);
 
 export const adaptAdult = (id: string, idx: number) =>
   jpost(`/api/runs/${id}/chapter/${idx}/adapt_adult`);

@@ -40,6 +40,7 @@ class Chapter(BaseModel):
     plan: str                       # текст плана главы от Бота 4
     is_adult_point: bool = False    # Бот 4 решает, где адалт органичен
     adult_note: str = ""            # кто с кем и почему сцена уместна здесь
+    target_words: Optional[int] = None  # цель по словам (оверрайд default_words)
     dialogue: Optional[str] = None  # текст главы от Бота 5
     adult_scene: Optional[str] = None  # адалт-вставка от Бота 6
     translation: Optional[str] = None  # перевод от Бота 8
@@ -209,6 +210,7 @@ class State(TypedDict, total=False):
     suggested_chapters: int     # ИИ предложил оптимальное число глав
     count_reason: str           # обоснование предложения
     target_chapters: int        # утверждённое нарративщиком число глав
+    default_words: int          # цель по словам на главу (дефолт, ~3500)
 
     # --- Бот 1: логлайны + выбор ---
     loglines: list[str]         # распарсенный список вариантов логлайна
