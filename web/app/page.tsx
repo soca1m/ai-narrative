@@ -7,6 +7,7 @@ import {
   ChevronDown, ChevronRight, MessageSquare, Sparkles, Wrench, Link2,
   ScanSearch, SendHorizontal, AlertTriangle, Loader2, BookOpenText,
   CircleCheckBig, RefreshCw, Wand2, ArrowRight, Circle, Minus, Pause,
+  Maximize2, Minimize2,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -785,16 +786,6 @@ export default function Page() {
                   onClick={onRestructure} title="Пересобрать сюжет под новое число глав">
                   <RefreshCw size={14} /> Пересобрать
                 </button>
-                <button className="small secondary" disabled={busy}
-                  onClick={() => onAddChapter((st.chapters?.length ?? 1) - 1, true)}
-                  title="ИИ допишет адалт-главу в конец">
-                  <Plus size={14} /> Глава в конец 🔞
-                </button>
-                <button className="small ghost" disabled={busy}
-                  onClick={() => onAddChapter((st.chapters?.length ?? 1) - 1, false)}
-                  title="ИИ допишет обычную (неадалт) главу в конец">
-                  <Plus size={14} /> Без адалта
-                </button>
               </div>
             )}
 
@@ -1020,7 +1011,20 @@ function Chapters(props: {
   const [working, setWorking] = useState<string | null>(null);
   const [toggled, setToggled] = useState<Record<number, boolean>>({});
   const [hlOn, setHlOn] = useState<Record<number, boolean>>({});  // подсветка замечаний
+  const [tall, setTall] = useState<Record<string, boolean>>({});  // высокие поля
   const dirty = Object.keys(edits).length > 0;
+  const tkey = (i: number, f: string) => `${i}-${f}`;
+  const tallCls = (i: number, f: string) => (tall[tkey(i, f)] ? "tall" : "");
+  function TallBtn({ i, f }: { i: number; f: string }) {
+    const on = !!tall[tkey(i, f)];
+    return (
+      <button className="xs ghost field-tall" type="button"
+        onClick={() => setTall((s) => ({ ...s, [tkey(i, f)]: !on }))}
+        title="Сделать поле выше/ниже для удобного чтения">
+        {on ? <><Minimize2 size={12} /> свернуть</> : <><Maximize2 size={12} /> развернуть</>}
+      </button>
+    );
+  }
   if (!props.chapters.length) return null;
 
   // сколько открытых критичных у главы (последний отчёт редактора)
@@ -1130,7 +1134,7 @@ function Chapters(props: {
             </button>
             {open && (<>
 
-            {/* #7: адалт-тоггл · вставить после (адалт/без) · удалить */}
+            {/* адалт-тоггл (до написания) · цель по словам */}
             <div className="chap-ops">
               {/* тоггл адалта имеет смысл ТОЛЬКО до написания главы (потом
                   адалт уже в тексте — переключать нечего) */}
@@ -1141,21 +1145,6 @@ function Chapters(props: {
                   🔞 адалт: {c.is_adult_point ? "вкл" : "выкл"}
                 </button>
               )}
-              <button className="xs ghost" disabled={props.busy}
-                onClick={() => props.onAddChapter(c.index, true)}
-                title="ИИ вставит адалт-главу после этой">
-                <Plus size={12} /> после 🔞
-              </button>
-              <button className="xs ghost" disabled={props.busy}
-                onClick={() => props.onAddChapter(c.index, false)}
-                title="ИИ вставит обычную (неадалт) главу после этой">
-                <Plus size={12} /> после (без адалта)
-              </button>
-              <button className="xs ghost" disabled={props.busy || props.chapters.length <= 1}
-                onClick={() => props.onDeleteChapter(c.index)}
-                title="Удалить эту главу">
-                <X size={12} /> удалить
-              </button>
               <span className="cw-sep" />
               <span className="cw-words" title="Цель по словам для этой главы (пусто = дефолт 3600)">
                 слов:
@@ -1244,8 +1233,8 @@ function Chapters(props: {
               </div>
             )}
 
-            <label>План · Бот 04</label>
-            <textarea rows={3} value={val(i, "plan", c.plan)} onChange={(e) => upd(i, "plan", e.target.value)} />
+            <div className="fieldhead"><label>План · Бот 04</label><TallBtn i={i} f="plan" /></div>
+            <textarea className={tallCls(i, "plan")} rows={3} value={val(i, "plan", c.plan)} onChange={(e) => upd(i, "plan", e.target.value)} />
             <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
               {c.dialogue != null && (
                 <button className="small secondary" disabled={working === `rw${i}` || props.busy}
@@ -1278,20 +1267,27 @@ function Chapters(props: {
               const dtext = val(i, "dialogue", c.dialogue);
               const hasQ = allFindings.some((f) => f.quote && dtext.includes(f.quote));
               return (<>
-              <label>Диалоги + адалт · Бот 05</label>
-              {hasQ && (
-                <button className="xs ghost" disabled={props.busy}
-                  onClick={() => setHlOn((s) => ({ ...s, [i]: !s[i] }))}
-                  title="Подсветить жёлтым места из замечаний редактора / вернуться к правке">
-                  {hlOn[i]
-                    ? <><Wand2 size={13} /> Редактировать текст</>
-                    : <><ScanSearch size={13} /> Подсветить замечания</>}
-                </button>
-              )}
+              <div className="fieldhead">
+                <label>Диалоги + адалт · Бот 05</label>
+                <span className="row" style={{ gap: 6 }}>
+                  {hasQ && (
+                    <button className="xs ghost" disabled={props.busy}
+                      onClick={() => setHlOn((s) => ({ ...s, [i]: !s[i] }))}
+                      title="Подсветить жёлтым места из замечаний редактора / вернуться к правке">
+                      {hlOn[i]
+                        ? <><Wand2 size={13} /> Редактировать текст</>
+                        : <><ScanSearch size={13} /> Подсветить замечания</>}
+                    </button>
+                  )}
+                  <TallBtn i={i} f="dialogue" />
+                </span>
+              </div>
               {hasQ && hlOn[i] ? (
-                <Highlighted text={dtext} findings={allFindings} active={activeFinding} onPick={(id) => pick(id, i)} />
+                <div className={`highlight-wrap ${tallCls(i, "dialogue")}`}>
+                  <Highlighted text={dtext} findings={allFindings} active={activeFinding} onPick={(id) => pick(id, i)} />
+                </div>
               ) : (
-                <textarea rows={12} value={dtext} onChange={(e) => upd(i, "dialogue", e.target.value)} />
+                <textarea className={tallCls(i, "dialogue")} rows={14} value={dtext} onChange={(e) => upd(i, "dialogue", e.target.value)} />
               )}
               <button className="small ghost" disabled={working === `sp${i}` || props.busy}
                 title="Сохранить текст и подогнать план главы под написанное"
@@ -1302,12 +1298,12 @@ function Chapters(props: {
               </button>
             </>); })()}
             {c.adult_scene != null && (<>
-              <label className="adult">Адалт-сцена · Бот 06</label>
-              <textarea rows={10} value={val(i, "adult_scene", c.adult_scene)} onChange={(e) => upd(i, "adult_scene", e.target.value)} />
+              <div className="fieldhead"><label className="adult">Адалт-сцена · Бот 06</label><TallBtn i={i} f="adult_scene" /></div>
+              <textarea className={tallCls(i, "adult_scene")} rows={10} value={val(i, "adult_scene", c.adult_scene)} onChange={(e) => upd(i, "adult_scene", e.target.value)} />
             </>)}
             {c.translation != null && (<>
-              <label>Перевод · Бот 08</label>
-              <textarea rows={7} value={val(i, "translation", c.translation)} onChange={(e) => upd(i, "translation", e.target.value)} />
+              <div className="fieldhead"><label>Перевод · Бот 08</label><TallBtn i={i} f="translation" /></div>
+              <textarea className={tallCls(i, "translation")} rows={7} value={val(i, "translation", c.translation)} onChange={(e) => upd(i, "translation", e.target.value)} />
             </>)}
             </>)}
           </div>

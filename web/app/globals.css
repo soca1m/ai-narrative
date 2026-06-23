@@ -642,3 +642,9 @@ button:disabled.xs { opacity: 0.7; }
 .cw-words { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
 .cw-words input { width: 70px; padding: 3px 6px; font-size: 11px; }
 .cw-count { font-size: 11px; color: var(--ember-soft); font-weight: 600; }
+
+/* развернуть поля содержимого глав для удобного чтения */
+.fieldhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.field-tall { flex-shrink: 0; }
+textarea.tall { height: 72vh; min-height: 320px; }
+.highlight-wrap.tall { max-height: 72vh; overflow-y: auto; }
