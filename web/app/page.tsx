@@ -810,6 +810,7 @@ export default function Page() {
               reports={reports}
               onSaveAll={(chs) => guard(async () => { if (threadId) { await patchState(threadId, { chapters: chs }); refresh(); } })}
               onReviseChapter={(i, fb) => guard(async () => { if (threadId) { await reviseChapter(threadId, i, fb); refresh(); } })}
+              onReviseDialogue={(i, fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "dialogue", fb, i); refresh(); } })}
               onRewriteDialogue={(i) => guard(async () => { if (threadId) { await rewriteDialogue(threadId, i); refresh(); } })}
               onSyncPlan={(i) => guard(async () => { if (threadId) { await syncPlan(threadId, i); refresh(); } })}
               rollbackStage={currentStage === "dialogue" ? "dialogue" : currentStage === "structure" ? "structure" : null}
@@ -988,6 +989,7 @@ function Chapters(props: {
   onDownload?: (fmt: "txt" | "md") => void;
   onSaveAll: (chs: Chapter[]) => void;
   onReviseChapter: (i: number, fb: string) => Promise<void>;
+  onReviseDialogue: (i: number, fb: string) => Promise<void>;
   onRewriteDialogue: (i: number) => Promise<void>;
   onSyncPlan: (i: number) => Promise<void>;
   onRefresh: () => void;
@@ -1068,12 +1070,6 @@ function Chapters(props: {
     setEdits({});
   }
   // мгновенно переключить адалт/неадалт у главы (с сохранением текущих правок)
-  async function toggleAdult(ch: Chapter) {
-    const merged = buildMerged().map((x) =>
-      x.index === ch.index ? { ...x, is_adult_point: !ch.is_adult_point } : x);
-    await props.onSaveAll(merged);
-    setEdits({});
-  }
   async function withWork(key: string, fn: () => Promise<void>) {
     setWorking(key);
     try { await commit(); await fn(); } finally { setWorking(null); }
@@ -1134,17 +1130,8 @@ function Chapters(props: {
             </button>
             {open && (<>
 
-            {/* адалт-тоггл (до написания) · цель по словам */}
+            {/* цель по словам (адалт теперь в каждой главе — тоггла нет) */}
             <div className="chap-ops">
-              {/* тоггл адалта имеет смысл ТОЛЬКО до написания главы (потом
-                  адалт уже в тексте — переключать нечего) */}
-              {c.dialogue == null && (
-                <button className={`xs ${c.is_adult_point ? "" : "ghost"}`} disabled={props.busy}
-                  onClick={() => toggleAdult(c)}
-                  title="До написания: сделать главу адалт / неадалт">
-                  🔞 адалт: {c.is_adult_point ? "вкл" : "выкл"}
-                </button>
-              )}
               <span className="cw-sep" />
               <span className="cw-words" title="Цель по словам для этой главы (пусто = дефолт 3600)">
                 слов:
@@ -1296,6 +1283,9 @@ function Chapters(props: {
                   ? <><Loader2 size={14} className="spin" /> Синхронизирую…</>
                   : <><RefreshCw size={14} /> Диалоги → обновить план</>}
               </button>
+              <ReviseBox label="Попросить ИИ переписать диалоги/сцену по правкам (вкл. адалт)"
+                disabled={props.busy}
+                onRevise={(fb) => props.onReviseDialogue(i, fb)} />
             </>); })()}
             {c.adult_scene != null && (<>
               <div className="fieldhead"><label className="adult">Адалт-сцена · Бот 06</label><TallBtn i={i} f="adult_scene" /></div>

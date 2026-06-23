@@ -437,10 +437,10 @@ def gen_inserted_chapter(state: State, after_idx: int) -> Chapter:
             temperature=0.7)
         c = plan.chapters[0]
         plan_text = c.plan
-        if c.is_adult and c.adult_note:
+        if c.adult_note:  # все главы адалт
             plan_text = f"{plan_text}\n\n[Адалт-точка: {c.adult_note}]"
         return Chapter(index=after_idx + 1, title=c.title, plan=plan_text,
-                       is_adult_point=bool(c.is_adult),
+                       is_adult_point=True,
                        adult_note=c.adult_note or "")
     except LLMLimitError:
         raise  # лимит → пусть обработает _bg_op (баннер выбора), не глотаем
@@ -487,7 +487,7 @@ def structure_editor_node(state: State) -> dict:
 
     fixed = [
         Chapter(index=i, title=c.title, plan=c.plan,
-                is_adult_point=bool(c.is_adult), adult_note=c.adult_note or "")
+                is_adult_point=True, adult_note=c.adult_note or "")
         for i, c in enumerate(out.chapters)
     ]
     n = len(out.fixes)
@@ -616,50 +616,61 @@ def _expand_to_target(llm, system: str, ctx: str, text: str, target: int,
 
 _BRACE_TAG = re.compile(
     r"\{\s*(\d{2}-[A-Za-z][A-Za-z0-9]*(?:Anim)?-\d+)\s*\}")
+# грок иногда оборачивает в скобки только номер: {01}-VictorOffice-4
+_BRACE_NUM = re.compile(r"\{(\d{2})\}(?=-[A-Za-z])")
 
 
 def _normalize_tags(text: str) -> str:
-    """Снять фигурные скобки вокруг тегов кадров (грок иногда копирует {NN}-…
-    из примера) — иначе парсер статиков их не видит, и формат расходится с
-    тегами Claude."""
-    return _BRACE_TAG.sub(r"\1", text or "")
+    """Снять фигурные скобки вокруг тегов кадров (грок копирует {NN}-… из
+    примера) — иначе парсер статиков их не видит, и формат расходится с Claude.
+    Ловим оба варианта: {NN-Loc-N} и {NN}-Loc-N."""
+    text = _BRACE_TAG.sub(r"\1", text or "")
+    return _BRACE_NUM.sub(r"\1", text)
 
 
 def _insert_adult(state: State, ch: Chapter, idx: int, full: str,
                   words: int) -> str:
-    """Грок заполняет метку ADULT_MARKER откровенной сценой.
+    """Грок заполняет КАЖДУЮ метку ADULT_MARKER откровенной сценой.
 
-    Грок получает контекст «до»/«после» метки и пишет ТОЛЬКО сцену между ними —
-    без послесловия/перехода (его уже написал Claude после метки) → нет дублей.
+    В главе может быть НЕСКОЛЬКО меток — для каждой генерим свою сцену с её
+    локальным контекстом «до»/«после» (без послесловия → нет дублей). Бюджет
+    слов делится между сценами.
     """
-    if prompts.ADULT_MARKER not in full:
-        # Claude не поставил метку → ставим перед последним абзацем-финалом.
-        full = full.rstrip() + "\n\n" + prompts.ADULT_MARKER
-    head, _, tail = full.partition(prompts.ADULT_MARKER)
-    before = head.rstrip()[-2500:]          # подводка вплотную к сцене
-    after = tail.lstrip()[:1800]            # что идёт ПОСЛЕ — не повторять
+    marker = prompts.ADULT_MARKER
+    n = full.count(marker)
+    if n == 0:
+        full = full.rstrip() + "\n\n" + marker
+        n = 1
+    per = max(500, words // n)               # объём на одну сцену
     pair = ch.adult_note or "см. карточки персонажей"
     system = _sys(state, prompts.ADULT, names=True)
-    user = (
-        prompts.ADULT_INSERT.format(
-            note=pair, nn=f"{idx + 1:02d}", words=words,
-            before=before, after=after)
-        + prompts.ADULT_CANON_GUARD.format(pair=pair))
-    try:
-        scene = _adult().complete(system, user)
-    except LLMLimitError:
-        raise
-    except Exception:
-        scene = ""
-    if not scene.strip() or _looks_like_refusal(scene):
-        ch.adult_block_reason = ("Адалт-сцена не сгенерирована — повтори правку "
-                                 "или допиши вручную")
-        return full.replace(prompts.ADULT_MARKER, "").strip()
-    ch.adult_block_reason = None
-    scene = _normalize_tags(scene.strip())
-    # заменяем ТОЛЬКО первую метку, лишние (если модель продублировала) — снимаем
-    out = full.replace(prompts.ADULT_MARKER, scene, 1)
-    return out.replace(prompts.ADULT_MARKER, "").strip()
+    inserted = 0
+    for _ in range(n):
+        head, sep, tail = full.partition(marker)
+        if not sep:
+            break
+        before = head.rstrip()[-2500:]       # подводка вплотную к сцене
+        after = tail.lstrip()[:1800]         # что идёт ПОСЛЕ — не повторять
+        user = (
+            prompts.ADULT_INSERT.format(
+                note=pair, nn=f"{idx + 1:02d}", words=per,
+                before=before, after=after)
+            + prompts.ADULT_CANON_GUARD.format(pair=pair))
+        try:
+            scene = _adult().complete(system, user)
+        except LLMLimitError:
+            raise
+        except Exception:
+            scene = ""
+        if not scene.strip() or _looks_like_refusal(scene):
+            full = full.replace(marker, "", 1)   # эту метку не закрыли — снимаем
+            continue
+        full = full.replace(marker, _normalize_tags(scene.strip()), 1)
+        inserted += 1
+    full = full.replace(marker, "")          # подчистить остатки меток
+    ch.adult_block_reason = (None if inserted else
+                             "Адалт-сцена не сгенерирована — повтори или допиши")
+    return _normalize_tags(full).strip()
 
 
 def write_chapter(state: State, ch: Chapter, idx: int,
