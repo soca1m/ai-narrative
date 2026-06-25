@@ -499,7 +499,7 @@ def revise_stage(thread_id: str, stage: str, req: ReviseReq):
 
     def _op():
         st = _state(thread_id)
-        st["revision_feedback"] = req.feedback
+        st["revision_feedback"] = nodes.to_english(req.feedback)  # RU→EN для агента
         if stage in ("dialogue", "adult"):
             st["revision_target"] = stage
         if req.chapter_idx is not None:
@@ -531,7 +531,7 @@ def revise_chapter(thread_id: str, idx: int, req: ReviseReq):
             f"Синопсис:\n{st2.get('synopsis','')}\n\n"
             f"Карточки:\n{st2.get('characters','')}\n\n"
             f"Глава {idx + 1}: {ch.title}\nТекущий план:\n{ch.plan}\n\n"
-            f"Правка нарративщика: {req.feedback}\n\n"
+            f"Правка нарративщика: {nodes.to_english(req.feedback)}\n\n"
             "Перепиши план ТОЛЬКО этой главы с учётом правки, сохранив "
             "непрерывность с остальными. Верни только новый текст плана, "
             "без преамбул."
@@ -1076,6 +1076,7 @@ def apply_revision(thread_id: str, idx: int, req: RevisionReq):
         f"{m.get('content', '')}"
         for m in (req.messages or []) if m.get("role") in ("user", "assistant")
     )
+    convo = nodes.to_english(convo)  # обсуждение на русском → EN для агента
     run.worker = threading.Thread(
         target=_revision_worker, args=(run, idx, to_fix, convo), daemon=True)
     run.worker.start()
@@ -1144,6 +1145,63 @@ def _sse(obj: dict) -> str:
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+# ---------- перевод (#3): кнопка «на русский» для нарративщика ----------
+
+class TranslateReq(BaseModel):
+    text: str
+    to: str = "Russian"        # "Russian" | "English" | язык
+
+
+@app.post("/api/translate")
+def translate_ep(req: TranslateReq):
+    """Перевод произвольного текста (вывод на английском → русский для чтения)."""
+    lang = {"ru": "Russian", "en": "English"}.get(req.to.lower(), req.to)
+    try:
+        return {"text": nodes.translate(req.text, lang)}
+    except LLMLimitError as exc:
+        raise HTTPException(429, _limit_detail(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"перевод недоступен (LLM): {str(exc)[:160]}")
+
+
+# ---------- dev: оверрайд системных промптов по шагам (#4) ----------
+
+def _prompt_defaults() -> dict:
+    from narrative import prompts as _p  # noqa: PLC0415
+    return {
+        "logline": _p.LOGLINE, "synopsis": _p.SYNOPSIS,
+        "characters": _p.CHARACTERS, "locations": _p.LOCATIONS,
+        "structure": _p.STRUCTURE, "structure_editor": _p.STRUCTURE_EDITOR,
+        "dialogue": _p.DIALOGUE, "adult": _p.ADULT,
+        "editor": _p.EDITOR, "translation": _p.TRANSLATION,
+    }
+
+
+@app.get("/api/prompts")
+def get_prompts():
+    """Дефолтные системные промпты по шагам (для dev-редактора промптов)."""
+    return {"defaults": _prompt_defaults()}
+
+
+class PromptOverrideReq(BaseModel):
+    stage: str
+    text: str = ""        # пустой → сброс к дефолту
+
+
+@app.post("/api/runs/{thread_id}/prompt_override")
+def set_prompt_override(thread_id: str, req: PromptOverrideReq):
+    """Задать/сбросить dev-оверрайд промпта шага для этого прогона."""
+    run = _get_run(thread_id)
+    st = _state(thread_id)
+    ov = dict(st.get("prompt_overrides") or {})
+    if req.text.strip():
+        ov[req.stage] = req.text
+    else:
+        ov.pop(req.stage, None)
+    _patch(thread_id, run, {"prompt_overrides": ov})
+    return {"ok": True, "overrides": list(ov.keys())}
 
 
 # ---------- экспорт готового проекта (скачиваемый текст) ----------

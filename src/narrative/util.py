@@ -21,9 +21,10 @@ def parse_loglines(text: str) -> list[str]:
     paras = [p.strip() for p in text.split("\n") if p.strip()]
     return paras or ([text.strip()] if text.strip() else [])
 
-# «ГЛАВА 1. «Название»» или «Глава 1: Название» — режем поглавный план Бота 4.
-_CHAPTER_RE = re.compile(r"^\s*ГЛАВА\s+(\d+)[\.\:]?\s*[«\"]?(.*?)[»\"]?\s*$",
-                         re.IGNORECASE | re.MULTILINE)
+# «ГЛАВА 1. «Название»» / «CHAPTER 1: Title» — режем поглавный план Бота 4.
+_CHAPTER_RE = re.compile(
+    r"^\s*(?:ГЛАВА|CHAPTER)\s+(\d+)[\.\:]?\s*[«\"]?(.*?)[»\"]?\s*$",
+    re.IGNORECASE | re.MULTILINE)
 
 
 def parse_chapters(structure_text: str) -> list[Chapter]:

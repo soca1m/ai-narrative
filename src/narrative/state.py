@@ -125,7 +125,7 @@ class FindingOut(BaseModel):
     Без UI-полей (id/status/comment), чтобы strict-схема не требовала их от модели.
     """
     severity: Severity
-    block: Literal["names", "motivation", "gender", "style"]
+    block: Literal["names", "motivation", "gender", "style", "policy"]
     responsible_node: NodeName = Field(
         description="Какой бот должен переделать. Обычно dialogue/adult, "
         "реже characters/structure для проблем уровня карточек/плана."
@@ -251,6 +251,8 @@ class State(TypedDict, total=False):
     force_openrouter: bool
     # последнее событие лимита (для баннера UI): {provider, reset_at, stage, kind}
     limit_info: Optional[dict]
+    # dev-оверрайды системных промптов по шагам: stage → текст промпта
+    prompt_overrides: dict[str, str]
 
     # --- управление циклом правок (editor ↔ bot) ---
     revision_target: Optional[NodeName]  # кого переделывать

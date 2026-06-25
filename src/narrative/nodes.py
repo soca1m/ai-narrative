@@ -99,6 +99,33 @@ def _llm_for(model: str | None):
 
 _MAX_CHAPTERS = 20  # хард-кап общего числа глав (страховка авто-петли структуры)
 
+# Перевод (#3): кнопка «на русский» для нарративщика + правки RU→EN перед агентом.
+_CYRILLIC = re.compile(r"[а-яё]", re.IGNORECASE)
+
+
+def _has_cyrillic(text: str | None) -> bool:
+    return bool(_CYRILLIC.search(text or ""))
+
+
+def translate(text: str, to_lang: str = "Russian",
+              state: State | None = None) -> str:
+    """Перевод текста на to_lang через LLM. Сохраняет формат ВН (имена,
+    теги кадров NN-Loc-N, блок выбора) — переводит только прозу/реплики."""
+    if not (text or "").strip():
+        return text
+    system = (
+        "You are a professional translator. Translate the text into "
+        f"{to_lang}. Keep visual-novel formatting EXACTLY: speaker labels "
+        "(NAME:) keep the name; frame-tag lines like '01-Office-2 — ...' keep "
+        "the tag code unchanged and translate only the description after the "
+        "dash; keep the choice block. Output ONLY the translation, no notes.")
+    return _structural(state).complete(system, text)
+
+
+def to_english(text: str, state: State | None = None) -> str:
+    """RU-правки → EN перед подачей агенту (если есть кириллица)."""
+    return translate(text, "English", state) if _has_cyrillic(text) else text
+
 
 def _stream_node(stage: str):
     """Декоратор: привязывает live-sink (из config графа) на время работы узла,
@@ -126,11 +153,28 @@ def _genre(state: State) -> str | None:
     return state.get("genre")
 
 
-def _sys(state: State, base: str, names: bool = False) -> str:
-    """Системный промпт + жанр (+ правило западных имён, где нужно)."""
+def _prompt(state: State | None, stage: str | None, default: str) -> str:
+    """Dev-оверрайд системного промпта шага (#4) или дефолт."""
+    if state is not None and stage:
+        ov = (state.get("prompt_overrides") or {}).get(stage)
+        if ov and ov.strip():
+            return ov
+    return default
+
+
+def _sys(state: State, base: str, names: bool = False,
+         stage: str | None = None) -> str:
+    """Системный промпт + жанр (+ правило языка/имён) + политика контента.
+
+    CONTENT_POLICY подмешивается во ВСЕ боты (через _sys) — жёсткий фильтр
+    запрещённого закладывается на этапе письма, до редактора. stage задан →
+    применяется dev-оверрайд промпта этого шага.
+    """
+    base = _prompt(state, stage, base)
     out = prompts.with_genre(base, _genre(state))
     if names:
         out += prompts.NAMES_RULE
+    out += prompts.CONTENT_POLICY
     return out
 
 
@@ -151,7 +195,7 @@ def logline_node(state: State) -> dict:
         user += f"\n\nПрошлые логлайны:\n{state.get('logline', '')}\n\n{fb}"
     user += prompts.NO_META
     out = _structural(state, "logline").complete(
-        _sys(state, prompts.LOGLINE, names=True), user)
+        _sys(state, prompts.LOGLINE, names=True, stage="logline"), user)
     loglines = parse_loglines(out)
     return {
         "logline": out,
@@ -173,7 +217,7 @@ def synopsis_node(state: State) -> dict:
         user += f"\n\nПредыдущий синопсис:\n{state.get('synopsis', '')}\n\n{fb}"
     user += prompts.NO_META
     out = _structural(state, "synopsis").complete(
-        _sys(state, prompts.SYNOPSIS, names=True), user)
+        _sys(state, prompts.SYNOPSIS, names=True, stage="synopsis"), user)
     return {
         "synopsis": out,
         "revision_feedback": None,
@@ -190,7 +234,7 @@ def characters_node(state: State) -> dict:
         user += f"\n\nПредыдущие карточки:\n{state.get('characters', '')}\n\n{fb}"
     user += prompts.NO_META
     out = _structural(state, "characters").complete(
-        _sys(state, prompts.CHARACTERS, names=True), user)
+        _sys(state, prompts.CHARACTERS, names=True, stage="characters"), user)
     return {
         "characters": out,
         "revision_feedback": None,
@@ -212,7 +256,7 @@ def locations_node(state: State) -> dict:
         user += f"\n\nПредыдущие локации:\n{state.get('locations', '')}\n\n{fb}"
     user += prompts.NO_META
     out = _structural(state, "locations").complete(
-        _sys(state, prompts.LOCATIONS, names=True), user)
+        _sys(state, prompts.LOCATIONS, names=True, stage="locations"), user)
     return {
         "locations": out,
         "revision_feedback": None,
@@ -236,7 +280,7 @@ def _gen_chapter_batch(state: State, start: int, n: int) -> tuple[list[Chapter],
     if fb:
         ctx += f"\n\n{fb}"
 
-    system = _sys(state, prompts.STRUCTURE, names=True)
+    system = _sys(state, prompts.STRUCTURE, names=True, stage="structure")
     suffix = prompts.STRUCTURE_BATCH_SUFFIX.format(n=n, start=start + 1)
     try:
         plan = _structural(state, "structure").structured(
@@ -384,7 +428,7 @@ def _gen_full_structure(state: State, target: int) -> list[Chapter]:
                 f"под {target} глав: растяни или сожми сюжет, сохрани удачные "
                 f"главы/повороты и канон, не выдумывай новую историю и не "
                 f"обрезай концовку:\n{prev}")
-    system = _sys(state, prompts.STRUCTURE, names=True)
+    system = _sys(state, prompts.STRUCTURE, names=True, stage="structure")
     suffix = prompts.STRUCTURE_FULL_SUFFIX.format(n=target)
     try:
         plan = _structural(state, "structure").structured(
@@ -430,7 +474,7 @@ def gen_inserted_chapter(state: State, after_idx: int) -> Chapter:
            + "\n\nСгенерируй РОВНО ОДНУ новую главу, которая логично встаёт "
            "между предыдущей и следующей (плавный переход, без дыр и повторов). "
            "Соблюдай адалт-разнообразие. Верни массив chapters c одним объектом.")
-    system = _sys(state, prompts.STRUCTURE, names=True)
+    system = _sys(state, prompts.STRUCTURE, names=True, stage="structure")
     try:
         plan = _structural(state, "structure").structured(
             system + prompts.STRUCTURE_JSON_SUFFIX, ctx, StructurePlan,
@@ -474,7 +518,7 @@ def structure_editor_node(state: State) -> dict:
     )
     try:
         out = _structural(state, "structure_editor").structured(
-            _sys(state, prompts.STRUCTURE_EDITOR, names=True)
+            _sys(state, prompts.STRUCTURE_EDITOR, names=True, stage="structure_editor")
             + prompts.STRUCTURE_EDITOR_JSON,
             user, StructureFixOut, temperature=0.4,
         )
@@ -518,7 +562,8 @@ def _looks_truncated(text: str | None) -> bool:
 # Маркеры завершённой главы — чтобы НЕ запускать лишний проход добора (он
 # переписывает концовку заново → дубли). Главу в формате ВН закрывает «ВЫБОР
 # ИГРОКА».
-_DONE_MARKERS = ("выбор игрока", "глава завершена", "конец главы")
+_DONE_MARKERS = ("выбор игрока", "глава завершена", "конец главы",
+                 "player choice", "the end", "end of chapter", "chapter ends")
 
 
 def _looks_complete(text: str | None) -> bool:
@@ -532,6 +577,10 @@ _META_SUB = (
     "присылай сценарн", "присылай план", "глава завершена", "показанный текст",
     "структура бита", "— закрыта", "принята. финал", "принята — финал",
     "глава 01 принята", "глава 02", "следующую главу из плана",
+    # английские аналоги (вывод теперь на английском)
+    "waiting for the next", "send the next", "ready for the next",
+    "send chapter", "next chapter when", "chapter complete", "let me know",
+    "i'm ready", "ready when you", "awaiting the next", "hope this", "this scene",
 )
 
 
@@ -643,7 +692,7 @@ def _insert_adult(state: State, ch: Chapter, idx: int, full: str,
         n = 1
     per = max(500, words // n)               # объём на одну сцену
     pair = ch.adult_note or "см. карточки персонажей"
-    system = _sys(state, prompts.ADULT, names=True)
+    system = _sys(state, prompts.ADULT, names=True, stage="adult")
     inserted = 0
     for _ in range(n):
         head, sep, tail = full.partition(marker)
@@ -697,7 +746,7 @@ def write_chapter(state: State, ch: Chapter, idx: int,
     if feedback:
         base += f"\n\nТекущий черновик главы:\n{ch.dialogue or ''}\n\n{feedback}"
 
-    system = _sys(state, prompts.DIALOGUE, names=True) + prompts.STATICS_DIALOGUE
+    system = _sys(state, prompts.DIALOGUE, names=True, stage="dialogue") + prompts.STATICS_DIALOGUE
     user = base + prompts.CHAPTER_FULL_GUIDE.format(
         words=story_target, min=int(story_target * 0.8))
     if is_adult:
@@ -732,7 +781,7 @@ def expand_chapter(state: State, ch: Chapter, idx: int,
     сохранив события и теги. Адалт-главу растягивает грок (без цензуры)."""
     is_adult = bool(ch.is_adult_point)
     statics_block = prompts.STATICS_ADULT if is_adult else prompts.STATICS_DIALOGUE
-    system = _sys(state, prompts.DIALOGUE, names=True) + statics_block
+    system = _sys(state, prompts.DIALOGUE, names=True, stage="dialogue") + statics_block
     user = (
         f"Карточки персонажей:\n{state['characters']}" + _loc_block(state)
         + f"\n\nНомер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
@@ -774,11 +823,11 @@ def patch_chapter(state: State, ch: Chapter, idx: int,
 
     is_adult = bool(ch.is_adult_point)
     if is_adult:
-        system = (_sys(state, prompts.DIALOGUE, names=True)
+        system = (_sys(state, prompts.DIALOGUE, names=True, stage="dialogue")
                   + prompts.DIALOGUE_ADULT_EXTRA + prompts.STATICS_ADULT)
         llm = _adult()
     else:
-        system = (_sys(state, prompts.DIALOGUE, names=True)
+        system = (_sys(state, prompts.DIALOGUE, names=True, stage="dialogue")
                   + prompts.STATICS_DIALOGUE)
         llm = _structural(state, "dialogue")
 
@@ -821,7 +870,7 @@ def sync_plan_from_dialogue(state: State, ch: Chapter, idx: int) -> str:
         "Верни только новый план главы, без преамбул."
     )
     return _structural(state, "dialogue").complete(
-        _sys(state, prompts.STRUCTURE, names=True), user)
+        _sys(state, prompts.STRUCTURE, names=True, stage="structure"), user)
 
 
 @_stream_node("dialogue")
@@ -1006,7 +1055,7 @@ def editor_node(state: State) -> dict:
         )
     try:
         out: EditorReportOut = _editor(state, "editor").structured(
-            prompts.EDITOR, user, EditorReportOut)
+            _prompt(state, "editor", prompts.EDITOR), user, EditorReportOut)
     except Exception as exc:
         report = EditorReport(chapter_index=idx, findings=[],
                               markdown=f"[редактор пропущен: {exc}]")
@@ -1050,7 +1099,7 @@ def translation_node(state: State) -> dict:
         if ch.adult_scene:
             text += f"\n\n--- АДАЛТ ---\n{ch.adult_scene}"
         ch.translation = _structural(state, "translation").complete(
-            prompts.TRANSLATION,
+            _prompt(state, "translation", prompts.TRANSLATION),
             f"Целевой язык: {lang}\n\nТекст:\n{text}",
         )
         chapters[i] = ch

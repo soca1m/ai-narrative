@@ -648,3 +648,10 @@ button:disabled.xs { opacity: 0.7; }
 .field-tall { flex-shrink: 0; }
 textarea.tall { height: 72vh; min-height: 320px; }
 .highlight-wrap.tall { max-height: 72vh; overflow-y: auto; }
+
+/* перевод на русский (#3) */
+.trbox { margin: 6px 0 2px; }
+.tr-err { font-size: 11px; color: var(--brick); margin-left: 8px; }
+.tr-out { margin-top: 8px; padding: 10px 12px; border: 1px dashed var(--line2);
+  border-radius: 8px; background: var(--ink2); color: var(--paper-dim);
+  font-size: 13px; line-height: 1.6; white-space: pre-wrap; }

@@ -52,6 +52,7 @@ export type NarrativeState = {
   default_words?: number;
   stage_providers?: Record<string, string>;
   force_openrouter?: boolean;
+  prompt_overrides?: Record<string, string>;
   limit_info?: LimitInfo | null;
   chapters?: Chapter[];
   chapter_idx?: number;
@@ -255,6 +256,16 @@ export const exportProject = (
   id: string, fmt: "txt" | "md" = "txt",
 ): Promise<{ filename: string; text: string; chapters: number }> =>
   jget(`/api/runs/${id}/export?fmt=${fmt}`);
+
+// #3: перевод произвольного текста (английский вывод → русский для чтения)
+export const translateText = (text: string, to: "ru" | "en" = "ru"): Promise<{ text: string }> =>
+  jpost("/api/translate", { text, to });
+
+// #4 (dev): дефолтные промпты по шагам + оверрайд на прогон
+export const getPrompts = (): Promise<{ defaults: Record<string, string> }> =>
+  jget("/api/prompts");
+export const setPromptOverride = (id: string, stage: string, text: string) =>
+  jpost(`/api/runs/${id}/prompt_override`, { stage, text });
 
 export const adaptAdult = (id: string, idx: number) =>
   jpost(`/api/runs/${id}/chapter/${idx}/adapt_adult`);

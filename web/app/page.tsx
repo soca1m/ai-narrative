@@ -7,7 +7,7 @@ import {
   ChevronDown, ChevronRight, MessageSquare, Sparkles, Wrench, Link2,
   ScanSearch, SendHorizontal, AlertTriangle, Loader2, BookOpenText,
   CircleCheckBig, RefreshCw, Wand2, ArrowRight, Circle, Minus, Pause,
-  Maximize2, Minimize2,
+  Maximize2, Minimize2, Languages,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -29,6 +29,9 @@ import {
   setChapterWords,
   expandChapter,
   expandStage,
+  translateText,
+  getPrompts,
+  setPromptOverride,
   resolveLimit,
   RunSummary,
   listRuns,
@@ -129,6 +132,31 @@ function cleanLive(t: string): string {
 function wordCount(s: string | null | undefined): number {
   const t = (s ?? "").trim();
   return t ? t.split(/\s+/).length : 0;
+}
+
+// #3: кнопка «перевести на русский» для нарративщиков, кто не знает англ
+function TranslateBox({ text }: { text: string | null | undefined }) {
+  const [ru, setRu] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(false);
+  if (!text || !text.trim()) return null;
+  async function go() {
+    if (ru !== null) { setRu(null); return; }
+    setBusy(true); setErr(false);
+    try { const r = await translateText(text!, "ru"); setRu(r.text); }
+    catch { setErr(true); } finally { setBusy(false); }
+  }
+  return (
+    <div className="trbox">
+      <button className="xs ghost" onClick={go} disabled={busy}
+        title="Перевести этот текст на русский (через ИИ)">
+        {busy ? <Loader2 size={12} className="spin" /> : <Languages size={12} />}
+        {ru !== null ? "скрыть перевод" : "перевести на русский"}
+      </button>
+      {err && <span className="tr-err">перевод не удался</span>}
+      {ru !== null && <div className="tr-out">{ru}</div>}
+    </div>
+  );
 }
 
 type Ev = { i: number; kind: string; bot: number; chapter: number | null; text: string };
@@ -695,6 +723,8 @@ export default function Page() {
               </AnimatePresence>
               {!events.length && <div className="chip">ожидание…</div>}
             </div>
+            <PromptDevPanel threadId={threadId}
+              overrides={st.prompt_overrides ?? {}} onChanged={refresh} />
             <div className="thread">thread · {threadId}</div>
           </>
         )}
@@ -897,6 +927,72 @@ function GenCard({ bot, title, rows = 4, live }: { bot: string; title: string; r
   );
 }
 
+// #4 (dev): свёрнутая панель редактирования системных промптов по шагам
+function PromptDevPanel({ threadId, overrides, onChanged }: {
+  threadId: string; overrides: Record<string, string>; onChanged: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [defs, setDefs] = useState<Record<string, string> | null>(null);
+  const [stage, setStage] = useState("");
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function load() {
+    if (defs) return;
+    try { const d = await getPrompts(); setDefs(d.defaults); } catch {}
+  }
+  function pick(s: string) {
+    setStage(s);
+    setText(s ? (overrides[s] ?? defs?.[s] ?? "") : "");
+  }
+  async function save() {
+    if (!stage) return;
+    setBusy(true);
+    try { await setPromptOverride(threadId, stage, text); onChanged(); }
+    finally { setBusy(false); }
+  }
+  async function reset() {
+    if (!stage) return;
+    setBusy(true);
+    try { await setPromptOverride(threadId, stage, ""); setText(defs?.[stage] ?? ""); onChanged(); }
+    finally { setBusy(false); }
+  }
+  const stages = defs ? Object.keys(defs) : [];
+  return (
+    <div className="subpanel">
+      <div className="sp-head" style={{ cursor: "pointer" }}
+        onClick={() => { const v = !open; setOpen(v); if (v) load(); }}>
+        <span>Dev · промпты по шагам</span>
+        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+      </div>
+      {open && (
+        <div style={{ marginTop: 8 }}>
+          <div className="sp-hint">
+            Системный промпт каждого бота. Оверрайд хранится на этот прогон;
+            пусто/сброс → дефолт.
+          </div>
+          <select className="model-select" value={stage}
+            onChange={(e) => pick(e.target.value)}>
+            <option value="">— выбрать шаг —</option>
+            {stages.map((s) => (
+              <option key={s} value={s}>{s}{overrides[s] ? " ✎" : ""}</option>
+            ))}
+          </select>
+          {stage && (
+            <>
+              <textarea rows={10} value={text} style={{ marginTop: 8 }}
+                onChange={(e) => setText(e.target.value)} />
+              <div className="row" style={{ gap: 8, marginTop: 6 }}>
+                <button className="small" disabled={busy} onClick={save}>Сохранить</button>
+                <button className="small ghost" disabled={busy} onClick={reset}>Сбросить к дефолту</button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Stat({ v, k, cls }: { v: number; k: string; cls?: string }) {
   return (
     <div className={`stat ${cls ?? ""}`}><div className="v">{v}</div><div className="k">{k}</div></div>
@@ -975,6 +1071,7 @@ function EditableCard(props: {
         </span>
       </div>
       <textarea rows={props.rows} value={props.value} onChange={(e) => props.onChange(e.target.value)} />
+      <TranslateBox text={props.value} />
       <ReviseBox onRevise={props.onRevise} disabled={props.busy} />
     </div>
   );
@@ -1283,6 +1380,7 @@ function Chapters(props: {
                   ? <><Loader2 size={14} className="spin" /> Синхронизирую…</>
                   : <><RefreshCw size={14} /> Диалоги → обновить план</>}
               </button>
+              <TranslateBox text={dtext} />
               <ReviseBox label="Попросить ИИ переписать диалоги/сцену по правкам (вкл. адалт)"
                 disabled={props.busy}
                 onRevise={(fb) => props.onReviseDialogue(i, fb)} />
