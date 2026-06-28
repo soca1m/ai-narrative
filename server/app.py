@@ -527,12 +527,15 @@ def revise_chapter(thread_id: str, idx: int, req: ReviseReq):
         st2 = _state(thread_id)
         chapters = list(st2.get("chapters") or [])
         ch = chapters[idx]
+        loc = (st2.get("locations") or "").strip()
         user = (
-            f"Синопсис:\n{st2.get('synopsis','')}\n\n"
             f"Карточки:\n{st2.get('characters','')}\n\n"
-            f"Глава {idx + 1}: {ch.title}\nТекущий план:\n{ch.plan}\n\n"
+            + (f"Локации:\n{loc}\n\n" if loc else "")
+            + nodes._story_context(st2, idx).strip()
+            + f"\n\nГлава {idx + 1}: {ch.title}\nТекущий план:\n{ch.plan}\n\n"
             f"Правка нарративщика: {nodes.to_english(req.feedback)}\n\n"
-            "Перепиши план ТОЛЬКО этой главы с учётом правки, сохранив "
+            "Перепиши план ТОЛЬКО этой главы с учётом правки, сохранив формат "
+            "разделов (LOCATIONS/CHARACTERS/STORY/CHOICE/ADULT SCENES) и "
             "непрерывность с остальными. Верни только новый текст плана, "
             "без преамбул."
         )
@@ -679,13 +682,30 @@ def restructure(thread_id: str, req: CountReq):
 class AddChapterReq(BaseModel):
     after_idx: int = -1     # вставить ПОСЛЕ этого индекса; -1 → в начало
     is_adult: bool = True   # адалт-глава (по умолчанию да) или обычная
+    generate: bool = False  # True → ИИ сразу пишет план; False → пустой шаблон
 
 
 @app.post("/api/runs/{thread_id}/chapter/add")
 def add_chapter(thread_id: str, req: AddChapterReq):
-    """#7: добавить ОДНУ главу на лету (ИИ генерит план, связывает соседей)."""
+    """Добавить ОДНУ главу. По умолчанию — ПУСТОЙ черновик (без ИИ): план/текст
+    пишутся вручную или генерятся отдельной кнопкой. generate=True → ИИ сразу
+    напишет план (связав соседей)."""
     run = _get_run(thread_id)
     _busy(run)
+
+    if not req.generate:
+        # пустой шаблон — синхронно, без LLM
+        st = _state(thread_id)
+        chapters = list(st.get("chapters") or [])
+        after = max(-1, min(req.after_idx, len(chapters) - 1))
+        new_ch = Chapter(index=after + 1, title="Новая глава", plan="",
+                         is_adult_point=req.is_adult, adult_note="")
+        chapters.insert(after + 1, new_ch)
+        for i, ch in enumerate(chapters):
+            ch.index = i
+        _patch(thread_id, run, {"chapters": chapters})
+        run.events.put({"type": "edited", "keys": ["chapters"]})
+        return {"ok": True, "chapters": len(chapters), "new_index": after + 1}
 
     def _op():
         st = _state(thread_id)
@@ -702,6 +722,42 @@ def add_chapter(thread_id: str, req: AddChapterReq):
         run.events.put({"type": "edited", "keys": ["chapters"]})
 
     return _bg_op(run, _op)
+
+
+@app.post("/api/runs/{thread_id}/chapter/{idx}/gen_plan")
+def gen_chapter_plan(thread_id: str, idx: int):
+    """Сгенерировать ИИ план для (обычно пустой) главы idx — видит все главы."""
+    run = _get_run(thread_id)
+    _busy(run)
+
+    def _op():
+        st = _state(thread_id)
+        chapters = list(st.get("chapters") or [])
+        if idx < 0 or idx >= len(chapters):
+            raise HTTPException(400, "bad chapter index")
+        chapters[idx].plan = nodes.gen_chapter_plan(st, idx)
+        _patch(thread_id, run, {"chapters": chapters})
+        run.events.put({"type": "edited", "keys": ["chapters"]})
+
+    return _bg_op(run, _op)
+
+
+@app.post("/api/runs/{thread_id}/structure/manual")
+def manual_structure(thread_id: str):
+    """Пропустить выбор объёма и ИИ-структуру: создать ОДИН пустой черновик главы.
+    Дальше нарративщик добавляет главы и пишет/генерит планы вручную."""
+    run = _get_run(thread_id)
+    _busy(run)
+    ch = Chapter(index=0, title="Глава 1", plan="", is_adult_point=True,
+                 adult_note="")
+    patch = {"chapters": [ch], "target_chapters": 1, "structure_done": True,
+             "structure_fixes": [], "phase": "content", "chapter_idx": 0}
+    _patch(thread_id, run, patch, as_node="structure")
+    run.status = "paused"
+    run.error = ""
+    run.events.put({"type": "edited", "keys": ["chapters"]})
+    run.events.put({"type": "status", "status": "paused"})
+    return {"ok": True}
 
 
 @app.delete("/api/runs/{thread_id}/chapter/{idx}")
@@ -725,6 +781,53 @@ def delete_chapter(thread_id: str, idx: int):
     _patch(thread_id, run, patch)
     run.events.put({"type": "edited", "keys": ["chapters"]})
     return {"ok": True, "chapters": len(chapters)}
+
+
+class ReorderReq(BaseModel):
+    order: list[int]          # новая последовательность СТАРЫХ индексов глав
+
+
+@app.post("/api/runs/{thread_id}/chapter/reorder")
+def reorder_chapters(thread_id: str, req: ReorderReq):
+    """Drag-and-drop: задать новый порядок глав целиком. order — перестановка
+    текущих индексов (порядок в массиве = порядок повествования = порядок в коде)."""
+    run = _get_run(thread_id)
+    _busy(run)
+    st = _state(thread_id)
+    chapters = list(st.get("chapters") or [])
+    if sorted(req.order) != list(range(len(chapters))):
+        raise HTTPException(400, "bad order permutation")
+    new = [chapters[i] for i in req.order]
+    for i, ch in enumerate(new):
+        ch.index = i
+    _patch(thread_id, run, {"chapters": new})
+    run.events.put({"type": "edited", "keys": ["chapters"]})
+    return {"ok": True}
+
+
+class MoveReq(BaseModel):
+    dir: str                  # "up" | "down"
+
+
+@app.post("/api/runs/{thread_id}/chapter/{idx}/move")
+def move_chapter(thread_id: str, idx: int, req: MoveReq):
+    """#6: двигать главу вверх/вниз — меняет порядок и переиндексирует (порядок
+    в коде = порядок в массиве)."""
+    run = _get_run(thread_id)
+    _busy(run)
+    st = _state(thread_id)
+    chapters = list(st.get("chapters") or [])
+    if idx < 0 or idx >= len(chapters):
+        raise HTTPException(400, "bad chapter index")
+    j = idx - 1 if req.dir == "up" else idx + 1
+    if j < 0 or j >= len(chapters):
+        return {"ok": True, "chapters": len(chapters)}  # край — ничего
+    chapters[idx], chapters[j] = chapters[j], chapters[idx]
+    for i, ch in enumerate(chapters):
+        ch.index = i
+    _patch(thread_id, run, {"chapters": chapters})
+    run.events.put({"type": "edited", "keys": ["chapters"]})
+    return {"ok": True, "moved_to": j}
 
 
 # ---------- объём главы (слова) + «растянуть» ----------
@@ -891,23 +994,12 @@ def chat(thread_id: str, req: ChatReq):
     if st.get("synopsis"):
         ctx_parts.append(f"Синопсис:\n{st.get('synopsis')}")
 
-    # #4: общий обзор всех глав — чтобы чат понимал вопросы про соседние/
-    # следующие главы и другие этапы, а не падал/терялся вне одной главы.
+    # #4: ИИ видит планы И тексты ВСЕХ глав (даже пустых), текущая помечена —
+    # чтобы не путал, о какой главе речь, и держал непрерывность повествования.
     if chs:
-        overview = "\n".join(
-            f"{c.index + 1}. {c.title}"
-            f"{' [адалт]' if c.is_adult_point else ''}"
-            f"{' — написана' if c.dialogue else ' — не написана'}"
-            for c in chs
-        )
-        ctx_parts.append(f"Все главы (обзор):\n{overview}")
+        ctx_parts.append(nodes._all_chapters_context(st, req.chapter_idx))
 
     if req.chapter_idx is not None and 0 <= req.chapter_idx < len(chs):
-        ch = chs[req.chapter_idx]
-        ctx_parts.append(
-            f"ТЕКУЩАЯ глава {req.chapter_idx + 1} «{ch.title}»\n"
-            f"План:\n{ch.plan}\n\nТекст:\n{ch.dialogue or '(не написан)'}"
-        )
         last = _last_report(st, req.chapter_idx)
         if last and last.findings:
             joined = "\n".join(
@@ -928,10 +1020,12 @@ def chat(thread_id: str, req: ChatReq):
 
     system = (
         "Ты — опытный редактор визуальных новелл 18+, собеседник нарративщика. "
-        "Обсуждай по делу любой этап работы: главы, синопсис, персонажей, "
-        "локации, структуру. Предлагай конкретные варианты формулировок и "
-        "фиксов, объясняй коротко. Не переписывай главу целиком без просьбы. "
-        "Отвечай на языке нарративщика." + NO_MARKDOWN
+        "Обсуждаешь ТОЛЬКО текущую главу: её ПЛАН и ТЕКСТ (диалоги/адалт). "
+        "Соседние главы видишь лишь как контекст для непрерывности — НЕ предлагай "
+        "и НЕ берись менять другие главы, синопсис, персонажей, локации, "
+        "структуру или порядок глав. Предлагай конкретные формулировки и фиксы "
+        "по плану и тексту ЭТОЙ главы, объясняй коротко. Не переписывай главу "
+        "целиком без просьбы. Отвечай на языке нарративщика." + NO_MARKDOWN
         + "\n\nКОНТЕКСТ:\n" + "\n\n".join(ctx_parts)
     )
     history = [
@@ -952,6 +1046,138 @@ def _limit_detail(exc: LLMLimitError) -> dict:
     return {"error": "limit", "provider": exc.provider,
             "reset_at": exc.reset_at, "kind": exc.kind,
             "message": str(exc)[:200]}
+
+
+# ---------- ассистент по всему проекту (отдельная вкладка) ----------
+
+def _project_context(st: dict) -> str:
+    """Полный срез проекта для ассистента: логлайн, синопсис, персонажи,
+    локации, все главы (планы + тексты)."""
+    parts: list[str] = []
+    if st.get("selected_logline"):
+        parts.append(f"Логлайн (выбранный):\n{st['selected_logline']}")
+    elif st.get("loglines"):
+        parts.append("Логлайны (варианты):\n" + "\n".join(st["loglines"]))
+    if st.get("synopsis"):
+        parts.append(f"Синопсис:\n{st['synopsis']}")
+    if st.get("characters"):
+        parts.append(f"Персонажи:\n{st['characters']}")
+    if st.get("locations"):
+        parts.append(f"Локации:\n{st['locations']}")
+    allc = nodes._all_chapters_context(st)
+    if allc:
+        parts.append(allc)
+    return "\n\n".join(parts) or "(проект пуст — ещё ничего не сгенерировано)"
+
+
+class ProjectChatReq(BaseModel):
+    messages: list[dict]                 # [{role, content}]
+
+
+@app.post("/api/runs/{thread_id}/project_chat")
+def project_chat(thread_id: str, req: ProjectChatReq):
+    """Свободный чат по ВСЕМУ проекту (любой этап). Только обсуждение —
+    применение правок отдельной кнопкой (project_apply)."""
+    _get_run(thread_id)
+    st = _state(thread_id)
+    system = (
+        "Ты — ассистент-сценарист по визуальным новеллам 18+, помогаешь "
+        "нарративщику по ВСЕМУ проекту: логлайн, синопсис, персонажи, локации, "
+        "планы и тексты глав. Можешь обсуждать что угодно по проекту независимо "
+        "от этапа, предлагать конкретные правки содержимого. НО ты НЕ управляешь "
+        "пайплайном: не запускаешь этапы, не меняешь их порядок, не двигаешь "
+        "главы и не перескакиваешь между шагами — только содержимое результатов "
+        "ботов. Применение правок делает нарративщик кнопкой «Применить». "
+        "Отвечай по делу на языке нарративщика." + NO_MARKDOWN
+        + "\n\nПРОЕКТ:\n" + _project_context(st)
+    )
+    history = [
+        {"role": m.get("role", "user"), "content": str(m.get("content", ""))}
+        for m in req.messages[-20:]
+        if m.get("role") in ("user", "assistant")
+    ]
+    try:
+        reply = nodes._editor(st, "chat").chat(system, history)
+    except LLMLimitError as exc:
+        raise HTTPException(429, _limit_detail(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"ассистент недоступен (LLM): {str(exc)[:160]}")
+    return {"reply": reply}
+
+
+# целевое поле → (метка, что патчим)
+_APPLY_TARGETS = {"synopsis", "characters", "locations", "logline",
+                  "chapter_plan", "chapter_dialogue"}
+
+
+class ProjectApplyReq(BaseModel):
+    messages: list[dict]
+    target: str                          # см. _APPLY_TARGETS
+    chapter_idx: Optional[int] = None    # для chapter_*
+
+
+@app.post("/api/runs/{thread_id}/project_apply")
+def project_apply(thread_id: str, req: ProjectApplyReq):
+    """Применить обсуждённое в ассистент-чате к ОДНОМУ результату бота. Меняет
+    только содержимое выбранного поля, не трогает пайплайн/порядок."""
+    from narrative import prompts  # noqa: PLC0415
+    run = _get_run(thread_id)
+    _busy(run)
+    if req.target not in _APPLY_TARGETS:
+        raise HTTPException(400, f"bad target {req.target}")
+    st = _state(thread_id)
+    convo = nodes.to_english("\n".join(
+        f"{'Нарративщик' if m.get('role') == 'user' else 'ИИ'}: "
+        f"{m.get('content', '')}"
+        for m in (req.messages or []) if m.get("role") in ("user", "assistant")
+    ))
+
+    labels = {"synopsis": "СИНОПСИС", "characters": "КАРТОЧКИ ПЕРСОНАЖЕЙ",
+              "locations": "КАРТОЧКИ ЛОКАЦИЙ", "logline": "ЛОГЛАЙН",
+              "chapter_plan": "ПЛАН ГЛАВЫ", "chapter_dialogue": "ТЕКСТ ГЛАВЫ"}
+    chapters = list(st.get("chapters") or [])
+    idx = req.chapter_idx
+    if req.target in ("chapter_plan", "chapter_dialogue"):
+        if idx is None or not (0 <= idx < len(chapters)):
+            raise HTTPException(400, "нужен корректный chapter_idx")
+        cur = (chapters[idx].plan if req.target == "chapter_plan"
+               else (chapters[idx].dialogue or ""))
+    elif req.target == "logline":
+        cur = st.get("selected_logline") or (st.get("loglines") or [""])[0]
+    else:
+        cur = st.get(req.target) or ""
+
+    system = (
+        f"Ты редактор-сценарист 18+. Перепиши {labels[req.target]} с учётом "
+        "обсуждения ниже. Сохрани прежний формат и стиль, поменяй только то, что "
+        "обсудили. Верни ТОЛЬКО новый текст, без преамбул и пояснений."
+        + prompts.NAMES_RULE + prompts.CONTENT_POLICY
+        + "\n\nКОНТЕКСТ ПРОЕКТА:\n" + _project_context(st)
+    )
+    user = (f"ТЕКУЩЕЕ содержимое ({labels[req.target]}):\n{cur}\n\n"
+            f"Обсуждение правок:\n{convo}\n\nВыдай новый текст.")
+
+    def _op():
+        new = nodes._structural(st, None).complete(system, user)
+        if req.target in ("chapter_plan", "chapter_dialogue"):
+            chs = list(_state(thread_id).get("chapters") or [])
+            if req.target == "chapter_plan":
+                chs[idx].plan = new
+            else:
+                chs[idx].dialogue = new
+            _patch(thread_id, run, {"chapters": chs})
+            run.events.put({"type": "edited", "keys": ["chapters"]})
+        elif req.target == "logline":
+            lst = list(st.get("loglines") or [])
+            sel = st.get("selected_logline")
+            lst = [new if x == sel else x for x in lst] if sel in lst else [new, *lst]
+            _patch(thread_id, run, {"loglines": lst, "selected_logline": new})
+            run.events.put({"type": "edited", "keys": ["loglines"]})
+        else:
+            _patch(thread_id, run, {req.target: new})
+            run.events.put({"type": "edited", "keys": [req.target]})
+
+    return _bg_op(run, _op)
 
 
 @app.post("/api/runs/{thread_id}/chapter/{idx}/apply_chat")
@@ -1154,16 +1380,69 @@ class TranslateReq(BaseModel):
     to: str = "Russian"        # "Russian" | "English" | язык
 
 
+# язык → ISO-код для Google Translate
+_GT_CODE = {"russian": "ru", "english": "en", "ru": "ru", "en": "en"}
+
+
+def _gt_chunks(text: str, limit: int = 4500) -> list[str]:
+    """Бьём текст на куски < limit символов по границам строк (URL/лимит запроса)."""
+    out: list[str] = []
+    buf = ""
+    for line in text.splitlines(keepends=True):
+        if len(buf) + len(line) > limit and buf:
+            out.append(buf)
+            buf = ""
+        # одна строка длиннее лимита — режем жёстко
+        while len(line) > limit:
+            out.append(line[:limit])
+            line = line[limit:]
+        buf += line
+    if buf:
+        out.append(buf)
+    return out or [text]
+
+
+def _google_translate(text: str, to_code: str) -> str:
+    """Быстрый перевод через бесплатный endpoint Google Translate (без ключа,
+    без ИИ). sl=auto — автоопределение исходного языка."""
+    import httpx  # noqa: PLC0415
+    parts: list[str] = []
+    with httpx.Client(timeout=12) as cli:
+        for chunk in _gt_chunks(text):
+            r = cli.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client": "gtx", "sl": "auto", "tl": to_code,
+                        "dt": "t", "q": chunk},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            r.raise_for_status()
+            data = r.json()
+            # data[0] = список сегментов [[translated, original, ...], ...]
+            seg = "".join(s[0] for s in (data[0] or []) if s and s[0])
+            parts.append(seg)
+    return "".join(parts)
+
+
 @app.post("/api/translate")
 def translate_ep(req: TranslateReq):
-    """Перевод произвольного текста (вывод на английском → русский для чтения)."""
+    """Перевод произвольного текста (вывод на английском → русский для чтения).
+
+    Сначала пробуем быстрый Google Translate (без ИИ); если недоступен —
+    фолбэк на LLM-перевод (сохраняет ВН-формат)."""
+    if not (req.text or "").strip():
+        return {"text": req.text, "via": "noop"}
+    code = _GT_CODE.get(req.to.lower(), req.to.lower()[:2])
+    try:
+        return {"text": _google_translate(req.text, code), "via": "google"}
+    except Exception:  # noqa: BLE001 — любой сбой сети/парсинга → фолбэк на ИИ
+        pass
     lang = {"ru": "Russian", "en": "English"}.get(req.to.lower(), req.to)
     try:
-        return {"text": nodes.translate(req.text, lang)}
+        return {"text": nodes.translate(req.text, lang), "via": "llm"}
     except LLMLimitError as exc:
         raise HTTPException(429, _limit_detail(exc))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"перевод недоступен (LLM): {str(exc)[:160]}")
+        raise HTTPException(502, f"перевод недоступен: {str(exc)[:160]}")
 
 
 # ---------- dev: оверрайд системных промптов по шагам (#4) ----------

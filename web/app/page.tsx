@@ -7,7 +7,8 @@ import {
   ChevronDown, ChevronRight, MessageSquare, Sparkles, Wrench, Link2,
   ScanSearch, SendHorizontal, AlertTriangle, Loader2, BookOpenText,
   CircleCheckBig, RefreshCw, Wand2, ArrowRight, Circle, Minus, Pause,
-  Maximize2, Minimize2, Languages,
+  Maximize2, Minimize2, Languages, ArrowUp, ArrowDown, Trash2, HelpCircle,
+  GripVertical,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -19,16 +20,22 @@ import {
   ClaudeStatus,
   NarrativeState,
   LimitInfo,
+  ApplyTarget,
+  projectChat,
+  projectApply,
   chatWithEditor,
   applyChatToChapter,
   applyRevision,
   exportProject,
   restructure,
   addChapter,
+  genChapterPlan,
+  manualStructure,
   deleteChapter,
+  moveChapter,
+  reorderChapters,
   setChapterWords,
   expandChapter,
-  expandStage,
   translateText,
   getPrompts,
   setPromptOverride,
@@ -76,7 +83,7 @@ const STAGES: [string, string, string][] = [
 const STAGE_DESC: Record<string, string> = {
   logline: "Бот придумает несколько вариантов логлайна — выберешь один.",
   synopsis: "Развёрнутый синопсис на основе выбранного логлайна.",
-  characters: "Карточки персонажей: внешность, характер, мотивации (канон).",
+  characters: "Карточки персонажей: характер, мотивации, роль (без внешности).",
   locations: "Карточки локаций: места действия, атмосфера, теги для художника.",
   chapter_count: "ИИ оценит и предложит оптимальное число глав.",
   structure: "Поглавный план: что в каждой главе + где адалт-точки.",
@@ -90,6 +97,33 @@ const BOT_NAME: Record<number, string> = {
   1: "Логлайн", 2: "Синопсис", 3: "Персонажи", 4: "Структура",
   5: "Диалоги", 6: "Адалт", 7: "Редактор", 8: "Перевод",
 };
+
+// #3: маленькие подсказки по каждому боту — как с ним работать.
+const BOT_HINTS: Record<string, string> = {
+  logline: "Бот даёт несколько завязок. Выбери одну — она ляжет в основу всей "
+    + "истории. Правки пиши на русском: «мрачнее», «добавь любовную линию».",
+  synopsis: "Краткое содержание всей новеллы. Правь здесь тон и ключевые "
+    + "повороты ДО того, как пойдут главы — потом всё опирается на синопсис.",
+  characters: "Карточки о характере, мотивации и роли — НЕ о внешности. Имена "
+    + "и мотивации отсюда боты дальше не меняют. Правь через ИИ на русском.",
+  locations: "Места действия и их CamelCase-теги для художника (идут в статики "
+    + "глав). Кнопкой «изменить через ИИ» опиши правку на русском — бот перепишет.",
+  structure: "Поглавный план. У каждой главы: LOCATIONS, кто участвует, STORY "
+    + "(обычная часть) и отдельно ADULT SCENES. Главы можно двигать/добавлять/удалять.",
+  dialogue: "Главы репликами. Правь прямо в поле или попроси ИИ переписать на "
+    + "русском. «План → переписать диалоги» подгонит текст под изменённый план.",
+};
+
+// #3: строка-подсказка под шапкой бота
+function BotHint({ stage }: { stage: string }) {
+  const t = BOT_HINTS[stage];
+  if (!t) return null;
+  return (
+    <div className="bot-hint" title="Как работать с этим ботом">
+      <HelpCircle size={13} /> <span>{t}</span>
+    </div>
+  );
+}
 
 // человекочитаемое имя следующего шага (узлы графа, включая служебные) —
 // чтобы кнопка «Продолжить» не показывала технический id вроде structure_editor
@@ -148,10 +182,10 @@ function TranslateBox({ text }: { text: string | null | undefined }) {
   }
   return (
     <div className="trbox">
-      <button className="xs ghost" onClick={go} disabled={busy}
+      <button className="small ghost" onClick={go} disabled={busy}
         title="Перевести этот текст на русский (через ИИ)">
-        {busy ? <Loader2 size={12} className="spin" /> : <Languages size={12} />}
-        {ru !== null ? "скрыть перевод" : "перевести на русский"}
+        {busy ? <Loader2 size={14} className="spin" /> : <Languages size={14} />}
+        {ru !== null ? "Скрыть перевод" : "Перевести на русский"}
       </button>
       {err && <span className="tr-err">перевод не удался</span>}
       {ru !== null && <div className="tr-out">{ru}</div>}
@@ -251,7 +285,7 @@ export default function Page() {
     "Закрытый теннисный клуб, лето, борьба за власть. Лёгкая мистика.",
   );
   const [genre, setGenre] = useState("");
-  const [lang, setLang] = useState("Russian");
+  const lang = "English";  // генерация всегда на английском (поле языка убрано)
   const [translation, setTranslation] = useState(false);
   const [stepMode, setStepMode] = useState(true);
 
@@ -270,6 +304,7 @@ export default function Page() {
   const [saved, setSaved] = useState<string | null>(null);
   const [countInput, setCountInput] = useState<number | "">("");
   const [reCount, setReCount] = useState<number | "">("");  // #7 пересборка
+  const [tab, setTab] = useState<"pipeline" | "assistant">("pipeline");
 
   // список прошлых работ (продолжить оборванную / скачать)
   const [runs, setRuns] = useState<RunSummary[]>([]);
@@ -365,13 +400,28 @@ export default function Page() {
       setReCount(""); setStatus("running"); poll(threadId);
     } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось пересобрать"); }
   }
-  async function onAddChapter(after: number, isAdult = true) {
+  async function onAddChapter(after: number, isAdult = true, generate = false) {
     if (!threadId) return;
     try {
       setErr(null);
-      await addChapter(threadId, after, isAdult);
-      setStatus("running"); poll(threadId);
+      await addChapter(threadId, after, isAdult, generate);
+      if (generate) { setStatus("running"); poll(threadId); } else { refresh(); }
     } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось добавить главу"); }
+  }
+  async function onGenChapterPlan(idx: number) {
+    if (!threadId) return;
+    try {
+      setErr(null);
+      await genChapterPlan(threadId, idx);
+      setStatus("running"); poll(threadId);
+    } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось сгенерировать план"); }
+  }
+  async function onManualStructure() {
+    if (!threadId) return;
+    try {
+      setErr(null);
+      await manualStructure(threadId); refresh();
+    } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось создать черновик"); }
   }
   async function onDeleteChapter(idx: number) {
     if (!threadId) return;
@@ -380,6 +430,20 @@ export default function Page() {
       setErr(null);
       await deleteChapter(threadId, idx); refresh();
     } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось удалить главу"); }
+  }
+  async function onMoveChapter(idx: number, dir: "up" | "down") {
+    if (!threadId) return;
+    try {
+      setErr(null);
+      await moveChapter(threadId, idx, dir); refresh();
+    } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось переместить главу"); }
+  }
+  async function onReorderChapters(order: number[]) {
+    if (!threadId) return;
+    try {
+      setErr(null);
+      await reorderChapters(threadId, order); refresh();
+    } catch (e) { setErr(e instanceof Error ? e.message : "Не удалось изменить порядок"); }
   }
   async function onSetWords(idx: number, words: number) {
     if (!threadId) return;
@@ -541,8 +605,6 @@ export default function Page() {
         <label>Особый жанр</label>
         <input type="text" value={genre} onChange={(e) => setGenre(e.target.value)}
           placeholder="напр. комедийная драма" />
-        <label>Язык</label>
-        <input type="text" value={lang} onChange={(e) => setLang(e.target.value)} />
         <div className="check">
           <input id="tr" type="checkbox" checked={translation}
             onChange={(e) => setTranslation(e.target.checked)} />
@@ -706,6 +768,11 @@ export default function Page() {
                 }}>
                   <Check size={16} /> Писать {countInput || st.suggested_chapters} глав
                 </button>
+                <button className="wide secondary" style={{ marginTop: 8 }}
+                  title="Не задавать объём: создать один пустой черновик главы. Дальше добавишь сколько нужно и напишешь/сгенерируешь планы сам."
+                  onClick={onManualStructure}>
+                  <Plus size={16} /> Пропустить — пустой черновик
+                </button>
               </div>
             )}
 
@@ -732,6 +799,25 @@ export default function Page() {
 
       {/* STAGE */}
       <main className="stage-area">
+        {threadId && (
+          <div className="tabbar">
+            <button className={`tab ${tab === "pipeline" ? "active" : ""}`}
+              onClick={() => setTab("pipeline")}>Конвейер</button>
+            <button className={`tab ${tab === "assistant" ? "active" : ""}`}
+              onClick={() => setTab("assistant")}>
+              <MessageSquare size={14} /> Ассистент
+            </button>
+          </div>
+        )}
+
+        {threadId && (
+          <div style={{ display: tab === "assistant" ? "block" : "none" }}>
+            <AssistantTab threadId={threadId} busy={busy} onRefresh={refresh}
+              chapters={st.chapters ?? []} />
+          </div>
+        )}
+
+        {tab === "pipeline" && (<>
         {!threadId && (
           <div className="empty">
             Задай тему слева и запусти конвейер. Правь артефакты, проси ИИ переделать
@@ -824,7 +910,10 @@ export default function Page() {
 
             <Chapters
               onAddChapter={onAddChapter}
+              onGenChapterPlan={onGenChapterPlan}
               onDeleteChapter={onDeleteChapter}
+              onMoveChapter={onMoveChapter}
+              onReorderChapters={onReorderChapters}
               onSetWords={onSetWords}
               onExpandChapter={onExpandChapter}
               threadId={threadId}
@@ -852,35 +941,32 @@ export default function Page() {
             />
 
             {/* Локации (генерятся ПОСЛЕ персонажей → выше них: свежее сверху) */}
-            {showGen("locations") && <GenCard bot="04" title="Локации · места действия (канон)" rows={4} live={liveFor("locations")} />}
+            {showGen("locations") && <GenCard bot="04" title="Локации · места действия" rows={4} live={liveFor("locations")} />}
             <EditableCard
-              title="Локации · места действия (канон)" bot="04" rows={10} valKey="locations" busy={busy}
+              title="Локации · места действия" bot="04" rows={10} valKey="locations" busy={busy} hint={BOT_HINTS.locations}
               value={drafts.locations ?? ""} dirty={dirty.has("locations")} saved={saved === "locations"}
               onChange={(v) => edit("locations", v)} onSave={() => save("locations")}
               onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "locations", fb); refresh(); } })}
-              onExpand={() => guard(async () => { if (threadId) { await expandStage(threadId, "locations"); refresh(); } })}
               onRollback={currentStage === "locations" ? () => guard(async () => { if (threadId && confirm("Откатить этап локаций: удалить карточки локаций и сгенерировать заново?")) { await rollback(threadId, "locations"); refresh(); } }) : undefined}
             />
 
             {/* Персонажи */}
-            {showGen("characters") && <GenCard bot="03" title="Персонажи · карточки = канон" rows={6} live={liveFor("characters")} />}
+            {showGen("characters") && <GenCard bot="03" title="Персонажи · карточки" rows={6} live={liveFor("characters")} />}
             <EditableCard
-              title="Персонажи · карточки = канон" bot="03" rows={12} valKey="characters" busy={busy}
+              title="Персонажи · карточки" bot="03" rows={12} valKey="characters" busy={busy} hint={BOT_HINTS.characters}
               value={drafts.characters ?? ""} dirty={dirty.has("characters")} saved={saved === "characters"}
               onChange={(v) => edit("characters", v)} onSave={() => save("characters")}
               onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "characters", fb); refresh(); } })}
-              onExpand={() => guard(async () => { if (threadId) { await expandStage(threadId, "characters"); refresh(); } })}
               onRollback={currentStage === "characters" ? () => guard(async () => { if (threadId && confirm("Откатить этап персонажей: удалить карточки и сгенерировать заново?")) { await rollback(threadId, "characters"); refresh(); } }) : undefined}
             />
 
             {/* Синопсис */}
             {showGen("synopsis") && <GenCard bot="02" title="Синопсис" rows={5} live={liveFor("synopsis")} />}
             <EditableCard
-              title="Синопсис" bot="02" rows={10} valKey="synopsis" busy={busy}
+              title="Синопсис" bot="02" rows={10} valKey="synopsis" busy={busy} hint={BOT_HINTS.synopsis}
               value={drafts.synopsis ?? ""} dirty={dirty.has("synopsis")} saved={saved === "synopsis"}
               onChange={(v) => edit("synopsis", v)} onSave={() => save("synopsis")}
               onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "synopsis", fb); refresh(); } })}
-              onExpand={() => guard(async () => { if (threadId) { await expandStage(threadId, "synopsis"); refresh(); } })}
               onRollback={currentStage === "synopsis" ? () => guard(async () => { if (threadId && confirm("Откатить этап синопсиса: удалить синопсис и сгенерировать заново?")) { await rollback(threadId, "synopsis"); refresh(); } }) : undefined}
             />
 
@@ -891,14 +977,124 @@ export default function Page() {
               selected={st.selected_logline ?? ""}
               busy={busy}
               onSelect={(l) => guard(async () => { if (threadId) { await selectLogline(threadId, l); refresh(); } })}
+              onSave={(list, sel) => guard(async () => { if (threadId) { await patchState(threadId, { loglines: list, selected_logline: sel }); refresh(); } })}
               onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "logline", fb); refresh(); } })}
             />
           </>
         )}
+        </>)}
       </main>
     </div>
   );
 }
+
+
+// ---------- Ассистент: чат по всему проекту + применение правок ----------
+function AssistantTab({ threadId, busy, chapters, onRefresh }: {
+  threadId: string; busy?: boolean; chapters: Chapter[]; onRefresh: () => void;
+}) {
+  const [msgs, setMsgs] = useState<ChatMsg[]>([]);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [target, setTarget] = useState<ApplyTarget>("synopsis");
+  const [chIdx, setChIdx] = useState(0);
+  const [note, setNote] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const endRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs, sending]);
+
+  const needsChapter = target === "chapter_plan" || target === "chapter_dialogue";
+
+  async function send() {
+    const text = input.trim();
+    if (!text || sending) return;
+    const next = [...msgs, { role: "user" as const, content: text }];
+    setMsgs(next); setInput(""); setSending(true); setErr(null);
+    try {
+      const r = await projectChat(threadId, next);
+      setMsgs([...next, { role: "assistant", content: r.reply }]);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Ассистент недоступен");
+      setMsgs(next);
+    } finally { setSending(false); }
+  }
+
+  async function apply() {
+    if (!msgs.length || applying) return;
+    setApplying(true); setErr(null); setNote(null);
+    try {
+      await projectApply(threadId, target, msgs, needsChapter ? chIdx : undefined);
+      const lbl = TARGET_LABELS[target] + (needsChapter ? ` (глава ${chIdx + 1})` : "");
+      setNote(`Применено к: ${lbl}. Загляни во вкладку «Конвейер».`);
+      onRefresh();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Не удалось применить");
+    } finally { setApplying(false); }
+  }
+
+  return (
+    <div className="asst">
+      <div className="asst-head">
+        <MessageSquare size={16} /> Ассистент проекта
+        <span className="asst-sub">обсуждай весь проект; правки применяются только к выбранному результату бота</span>
+      </div>
+      <div className="asst-thread">
+        {!msgs.length && (
+          <div className="asst-empty">
+            Спроси что угодно по проекту: логлайн, синопсис, персонажи, локации, планы и тексты глав.
+            Обсуди правку — потом выбери, к чему её применить, и нажми «Применить».
+          </div>
+        )}
+        {msgs.map((m, i) => (
+          <div key={i} className={`ch-msg ${m.role}`}>{m.content}</div>
+        ))}
+        {sending && <div className="ch-msg assistant"><Loader2 size={14} className="spin" /> думает…</div>}
+        <div ref={endRef} />
+      </div>
+      {err && <div className="asst-err">{err}</div>}
+      {note && <div className="asst-note"><Check size={13} /> {note}</div>}
+      <div className="asst-apply">
+        <span className="lbl">Применить к:</span>
+        <select value={target} disabled={busy || applying}
+          onChange={(e) => setTarget(e.target.value as ApplyTarget)}>
+          <option value="synopsis">Синопсис</option>
+          <option value="characters">Персонажи</option>
+          <option value="locations">Локации</option>
+          <option value="logline">Логлайн</option>
+          <option value="chapter_plan">План главы</option>
+          <option value="chapter_dialogue">Текст главы</option>
+        </select>
+        {needsChapter && (
+          <select value={chIdx} disabled={busy || applying}
+            onChange={(e) => setChIdx(+e.target.value)}>
+            {chapters.map((c) => (
+              <option key={c.index} value={c.index}>Глава {c.index + 1} · {c.title}</option>
+            ))}
+          </select>
+        )}
+        <button className="small" disabled={busy || applying || !msgs.length}
+          title="ИИ перепишет выбранный результат по обсуждению (пайплайн и порядок не трогает)"
+          onClick={apply}>
+          {applying ? <><Loader2 size={14} className="spin" /> Применяю…</> : <><Check size={14} /> Применить</>}
+        </button>
+      </div>
+      <div className="asst-input">
+        <textarea rows={2} value={input} disabled={sending} placeholder="Сообщение ассистенту…"
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
+        <button className="small" disabled={sending || !input.trim()} onClick={send}>
+          <SendHorizontal size={15} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const TARGET_LABELS: Record<ApplyTarget, string> = {
+  synopsis: "Синопсис", characters: "Персонажи", locations: "Локации",
+  logline: "Логлайн", chapter_plan: "План главы", chapter_dialogue: "Текст главы",
+};
 
 
 // блок-плейсхолдер «ИИ пишет…»: скелет + спиннер, на месте будущего артефакта.
@@ -1023,23 +1219,40 @@ function ReviseBox({ label, onRevise, disabled }: {
 }
 
 function LoglineCard({
-  loglines, selected, onSelect, onRevise, busy,
+  loglines, selected, onSelect, onRevise, onSave, busy,
 }: {
   loglines: string[]; selected: string; busy?: boolean;
   onSelect: (l: string) => void; onRevise: (fb: string) => Promise<void>;
+  onSave: (list: string[], sel: string) => void;
 }) {
+  // локальные правки текста логлайнов; индекс выбранного держим по позиции
+  const [edits, setEdits] = useState<Record<number, string>>({});
+  const selIdx = loglines.findIndex((l) => l === selected);
+  const dirty = Object.keys(edits).length > 0;
   if (!loglines.length) return null;
+  const text = (i: number) => (i in edits ? edits[i] : loglines[i]);
+  function save() {
+    const list = loglines.map((_, i) => text(i));
+    const sel = selIdx >= 0 ? list[selIdx] : selected;
+    onSave(list, sel); setEdits({});
+  }
   return (
     <div className="card">
-      <div className="head"><span className="t"><span className="botnum">01</span>Логлайн · выбери один</span></div>
+      <div className="head">
+        <span className="t"><span className="botnum">01</span>Логлайн · выбери и правь</span>
+        {dirty && <button className="small" disabled={busy} onClick={save}><Check size={14} /> Сохранить</button>}
+      </div>
+      <BotHint stage="logline" />
       <div className="loglines">
         {loglines.map((l, i) => (
-          <label key={i} className={`logline ${selected === l ? "sel" : ""}`}>
+          <div key={i} className={`logline ${selected === l ? "sel" : ""}`}>
             <input type="radio" name="logline" disabled={busy} checked={selected === l} onChange={() => onSelect(l)} />
-            <span>{l}</span>
-          </label>
+            <textarea className="logline-edit" rows={2} value={text(i)} disabled={busy}
+              onChange={(e) => setEdits((s) => ({ ...s, [i]: e.target.value }))} />
+          </div>
         ))}
       </div>
+      <TranslateBox text={selIdx >= 0 ? text(selIdx) : loglines.join("\n\n")} />
       <ReviseBox label="Сгенерировать другие логлайны" onRevise={onRevise} disabled={busy} />
     </div>
   );
@@ -1047,7 +1260,7 @@ function LoglineCard({
 
 function EditableCard(props: {
   title: string; bot: string; rows: number; valKey: string; busy?: boolean;
-  value: string; dirty: boolean; saved: boolean;
+  value: string; dirty: boolean; saved: boolean; hint?: string;
   onChange: (v: string) => void; onSave: () => void;
   onRevise: (fb: string) => Promise<void>; onRollback?: () => Promise<void>;
   onExpand?: () => Promise<void>;
@@ -1070,6 +1283,11 @@ function EditableCard(props: {
           )}
         </span>
       </div>
+      {props.hint && (
+        <div className="bot-hint" title="Как работать с этим ботом">
+          <HelpCircle size={13} /> <span>{props.hint}</span>
+        </div>
+      )}
       <textarea rows={props.rows} value={props.value} onChange={(e) => props.onChange(e.target.value)} />
       <TranslateBox text={props.value} />
       <ReviseBox onRevise={props.onRevise} disabled={props.busy} />
@@ -1096,8 +1314,11 @@ function Chapters(props: {
   onDecide: (fid: string, body: { status?: FindingStatus; comment?: string; judge?: boolean }) => Promise<void>;
   onAdaptAdult: (i: number) => Promise<void>;
   onSkipAdult: (i: number) => Promise<void>;
-  onAddChapter: (after: number, isAdult?: boolean) => Promise<void>;
+  onAddChapter: (after: number, isAdult?: boolean, generate?: boolean) => Promise<void>;
+  onGenChapterPlan: (idx: number) => Promise<void>;
   onDeleteChapter: (idx: number) => Promise<void>;
+  onMoveChapter: (idx: number, dir: "up" | "down") => Promise<void>;
+  onReorderChapters: (order: number[]) => Promise<void>;
   onSetWords: (idx: number, words: number) => Promise<void>;
   onExpandChapter: (idx: number) => Promise<void>;
 }) {
@@ -1111,7 +1332,17 @@ function Chapters(props: {
   const [toggled, setToggled] = useState<Record<number, boolean>>({});
   const [hlOn, setHlOn] = useState<Record<number, boolean>>({});  // подсветка замечаний
   const [tall, setTall] = useState<Record<string, boolean>>({});  // высокие поля
+  const [dragIdx, setDragIdx] = useState<number | null>(null);    // drag-drop
+  const [overIdx, setOverIdx] = useState<number | null>(null);
   const dirty = Object.keys(edits).length > 0;
+  // drag-drop: переставить главу src на место dst (в порядке повествования)
+  function reorderTo(src: number, dst: number) {
+    if (src === dst) return;
+    const asc = [...props.chapters].sort((a, b) => a.index - b.index).map((c) => c.index);
+    const from = asc.indexOf(src);
+    asc.splice(asc.indexOf(dst), 0, asc.splice(from, 1)[0]);
+    props.onReorderChapters(asc);
+  }
   const tkey = (i: number, f: string) => `${i}-${f}`;
   const tallCls = (i: number, f: string) => (tall[tkey(i, f)] ? "tall" : "");
   function TallBtn({ i, f }: { i: number; f: string }) {
@@ -1156,6 +1387,7 @@ function Chapters(props: {
   function buildMerged(): Chapter[] {
     return props.chapters.map((c) => ({
       ...c,
+      title: val(c.index, "title", c.title),
       plan: val(c.index, "plan", c.plan),
       dialogue: c.dialogue == null ? null : val(c.index, "dialogue", c.dialogue),
       adult_scene: c.adult_scene == null ? null : val(c.index, "adult_scene", c.adult_scene),
@@ -1200,6 +1432,11 @@ function Chapters(props: {
               title="Удалить план глав и сгенерировать структуру заново"><Undo2 size={14} /> Откат — структура</button>
           )}
           {dirty && <button className="small" disabled={props.busy} onClick={commit}><Check size={14} /> Сохранить главы</button>}
+          <button className="small ghost" disabled={props.busy}
+            onClick={() => props.onAddChapter(props.chapters.length - 1)}
+            title="Добавить пустой черновик главы в конец (план напишешь сам или сгенерируешь ИИ)">
+            <Plus size={14} /> Добавить главу
+          </button>
         </span>
       </h2>
       {[...props.chapters].sort((a, b) => b.index - a.index).map((c) => {
@@ -1211,27 +1448,33 @@ function Chapters(props: {
         const openN = openAll(c.index);
         const open = isOpen(c.index);
         const verdict = !lastReport ? null : openN > 0 ? "needs" : "ok";
+        const isTop = i >= props.chapters.length - 1;   // верхняя на экране
+        const isBottom = i === 0;                        // нижняя = первая глава
         return (
-          <div className={`card chapter ${c.is_adult_point ? "adultcard" : ""} ${openN > 0 ? "needs" : ""}`} key={c.index}>
-            <button className="chap-head" onClick={() => toggle(c.index)}>
-              <span className="caret">{open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}</span>
-              <span className="t">Глава {c.index + 1} · {c.title}</span>
-              {c.is_adult_point && <span className="tag18">18+</span>}
-              {verdict === "needs" && (
-                <span className={`cbadge ${crit > 0 ? "crit" : "warn"}`}>
-                  <span className={`sevdot ${crit > 0 ? "crit" : "imp"}`} /> {openN} — решить
-                </span>
-              )}
-              {verdict === "ok" && <span className="cbadge ok"><Check size={12} /> готова</span>}
-              {c.dialogue == null && <span className="cbadge wait">черновик плана</span>}
-            </button>
-            {open && (<>
-
-            {/* цель по словам (адалт теперь в каждой главе — тоггла нет) */}
-            <div className="chap-ops">
-              <span className="cw-sep" />
-              <span className="cw-words" title="Цель по словам для этой главы (пусто = дефолт 3600)">
-                слов:
+          <div className={`card chapter ${c.is_adult_point ? "adultcard" : ""} ${openN > 0 ? "needs" : ""} ${overIdx === i && dragIdx !== null && dragIdx !== i ? "drag-over" : ""} ${dragIdx === i ? "dragging" : ""}`}
+            key={c.index}
+            onDragOver={(e) => { if (dragIdx !== null) { e.preventDefault(); setOverIdx(i); } }}
+            onDrop={(e) => { e.preventDefault(); if (dragIdx !== null) reorderTo(dragIdx, i); setDragIdx(null); setOverIdx(null); }}>
+            <div className="chap-head-row">
+              <span className="drag-handle" draggable
+                onDragStart={() => setDragIdx(i)}
+                onDragEnd={() => { setDragIdx(null); setOverIdx(null); }}
+                title="Перетащи, чтобы изменить порядок глав">
+                <GripVertical size={15} />
+              </span>
+              <button className="chap-head" onClick={() => toggle(c.index)}>
+                <span className="caret">{open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}</span>
+                <span className="t">Глава {c.index + 1} · {val(i, "title", c.title)}</span>
+                {c.is_adult_point && <span className="tag18">18+</span>}
+                {verdict === "needs" && (
+                  <span className={`cbadge ${crit > 0 ? "crit" : "warn"}`}>
+                    <span className={`sevdot ${crit > 0 ? "crit" : "imp"}`} /> {openN} — решить
+                  </span>
+                )}
+                {verdict === "ok" && <span className="cbadge ok"><Check size={12} /> готова</span>}
+                {c.dialogue == null && <span className="cbadge wait">черновик плана</span>}
+              </button>
+              <span className="chap-head-words" title="Цель по словам (пусто = 3600) и текущий объём">
                 <input type="number" min={0} step={250} placeholder="3600"
                   defaultValue={c.target_words ?? ""}
                   disabled={props.busy}
@@ -1239,19 +1482,49 @@ function Chapters(props: {
                     if (e.key === "Enter") props.onSetWords(c.index, +(e.target as HTMLInputElement).value || 0);
                   }}
                   onBlur={(e) => { const v = +e.target.value || 0; if ((c.target_words ?? 0) !== v) props.onSetWords(c.index, v); }} />
-                сл.
+                <span className="cw-unit">сл.</span>
+                {c.dialogue != null && <span className="cw-count">≈{wordCount(c.dialogue)}</span>}
               </span>
-              {c.dialogue != null && (
-                <span className="cw-count" title="Текущий объём главы">≈{wordCount(c.dialogue)} сл.</span>
-              )}
-              {c.dialogue != null && (
-                <button className="xs ghost" disabled={props.busy}
+            </div>
+            {open && (<>
+
+            {/* управление главой — порядок (на экране), вставка пустой, удаление.
+                Низ = первая глава по сюжету; «Выше»/«Ниже» = движение на экране. */}
+            <div className="chap-manage">
+              <button className="xs ghost" disabled={props.busy || isTop}
+                onClick={() => props.onMoveChapter(i, "down")}
+                title="Поднять главу выше на экране (ближе к финалу истории)">
+                <ArrowUp size={12} /> Выше
+              </button>
+              <button className="xs ghost" disabled={props.busy || isBottom}
+                onClick={() => props.onMoveChapter(i, "up")}
+                title="Опустить главу ниже на экране (ближе к началу истории)">
+                <ArrowDown size={12} /> Ниже
+              </button>
+              <button className="xs ghost danger" disabled={props.busy || props.chapters.length <= 1}
+                onClick={() => props.onDeleteChapter(i)}
+                title="Удалить эту главу (остальные переиндексируются)">
+                <Trash2 size={12} /> Удалить
+              </button>
+            </div>
+
+            {/* редактируемое название главы */}
+            <div className="fieldhead"><label>Название главы</label></div>
+            <input className="chap-title-input" type="text" disabled={props.busy}
+              value={val(i, "title", c.title)}
+              onChange={(e) => upd(i, "title", e.target.value)} />
+
+            {/* растянуть главу (объём/счётчик — в шапке) */}
+            {c.dialogue != null && (
+              <div className="chap-ops">
+                <span className="cw-sep" />
+                <button className="small ghost" disabled={props.busy}
                   onClick={() => props.onExpandChapter(c.index)}
                   title="Растянуть: сделать главу подробнее (~+800 слов)">
-                  <ArrowRight size={12} /> растянуть
+                  <ArrowRight size={14} /> Растянуть
                 </button>
-              )}
-            </div>
+              </div>
+            )}
 
             {/* пре-чек адалта: главе не из чего генерить сцену */}
             {c.adult_block_reason && (
@@ -1318,7 +1591,11 @@ function Chapters(props: {
             )}
 
             <div className="fieldhead"><label>План · Бот 04</label><TallBtn i={i} f="plan" /></div>
-            <textarea className={tallCls(i, "plan")} rows={3} value={val(i, "plan", c.plan)} onChange={(e) => upd(i, "plan", e.target.value)} />
+            <BotHint stage="structure" />
+            <textarea className={tallCls(i, "plan")} rows={3} value={val(i, "plan", c.plan)}
+              placeholder="План пуст — напиши сам по разделам (LOCATIONS / CHARACTERS / STORY / CHOICE / ADULT SCENES) или сгенерируй кнопкой ниже"
+              onChange={(e) => upd(i, "plan", e.target.value)} />
+            <TranslateBox text={val(i, "plan", c.plan)} />
             <div className="row" style={{ flexWrap: "wrap", gap: 8 }}>
               {c.dialogue != null && (
                 <button className="small secondary" disabled={working === `rw${i}` || props.busy}
@@ -1366,6 +1643,7 @@ function Chapters(props: {
                   <TallBtn i={i} f="dialogue" />
                 </span>
               </div>
+              <BotHint stage="dialogue" />
               {hasQ && hlOn[i] ? (
                 <div className={`highlight-wrap ${tallCls(i, "dialogue")}`}>
                   <Highlighted text={dtext} findings={allFindings} active={activeFinding} onPick={(id) => pick(id, i)} />

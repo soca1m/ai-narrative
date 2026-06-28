@@ -168,13 +168,26 @@ export const setChapterCount = (id: string, count: number) =>
 // #7: пересобрать структуру под новое число глав (растянуть/сжать)
 export const restructure = (id: string, count: number) =>
   jpost(`/api/runs/${id}/restructure`, { count });
-// #7: добавить главу после индекса (-1 → в начало), ИИ генерит план
-export const addChapter = (id: string, after_idx: number, is_adult = true) =>
-  jpost(`/api/runs/${id}/chapter/add`, { after_idx, is_adult });
+// добавить главу после индекса (-1 → в начало). generate=false → пустой
+// черновик (план пишут вручную/кнопкой); generate=true → ИИ сразу пишет план
+export const addChapter = (id: string, after_idx: number, is_adult = true, generate = false) =>
+  jpost(`/api/runs/${id}/chapter/add`, { after_idx, is_adult, generate });
+// сгенерировать ИИ план для (пустой) главы — видит все главы
+export const genChapterPlan = (id: string, idx: number) =>
+  jpost(`/api/runs/${id}/chapter/${idx}/gen_plan`);
+// пропустить выбор объёма/структуру → создать один пустой черновик
+export const manualStructure = (id: string) =>
+  jpost(`/api/runs/${id}/structure/manual`);
 // #7: удалить главу
 export const deleteChapter = (id: string, idx: number) =>
   fetch(`${API_BASE}/api/runs/${id}/chapter/${idx}`, { method: "DELETE" })
     .then((r) => { if (!r.ok) throw new Error(`del failed: ${r.status}`); return r.json(); });
+// #6: двигать главу вверх/вниз (меняет порядок и переиндексирует)
+export const moveChapter = (id: string, idx: number, dir: "up" | "down") =>
+  jpost(`/api/runs/${id}/chapter/${idx}/move`, { dir });
+// drag-and-drop: новый порядок глав целиком (перестановка старых индексов)
+export const reorderChapters = (id: string, order: number[]) =>
+  jpost(`/api/runs/${id}/chapter/reorder`, { order });
 
 // объём главы (слова): оверрайд цели на конкретную главу (0 → дефолт прогона)
 export const setChapterWords = (id: string, idx: number, words: number) =>
@@ -231,6 +244,18 @@ export const claudeExchange = (code: string): Promise<ClaudeStatus> =>
   jpost("/api/claude/exchange", { code });
 
 export type ChatMsg = { role: "user" | "assistant"; content: string };
+
+// Ассистент по всему проекту (отдельная вкладка): свободный чат + применение
+// правок к одному результату бота (не трогает пайплайн/порядок).
+export type ApplyTarget =
+  | "synopsis" | "characters" | "locations" | "logline"
+  | "chapter_plan" | "chapter_dialogue";
+export const projectChat = (id: string, messages: ChatMsg[]): Promise<{ reply: string }> =>
+  jpost(`/api/runs/${id}/project_chat`, { messages });
+export const projectApply = (
+  id: string, target: ApplyTarget, messages: ChatMsg[], chapter_idx?: number,
+): Promise<{ ok?: boolean; started?: boolean }> =>
+  jpost(`/api/runs/${id}/project_apply`, { target, messages, chapter_idx });
 export const chatWithEditor = (
   id: string,
   messages: ChatMsg[],

@@ -608,6 +608,39 @@ button:disabled.xs { opacity: 0.7; }
 .chapctl .cc-lbl { font-size: 13px; color: var(--paper); }
 .chapctl input { width: 110px; }
 .chap-ops { display: flex; gap: 6px; margin: 2px 0 10px; }
+/* #6: панель управления главой (порядок/вставка/удаление). Все кнопки xs —
+   единый размер; flex:0 0 auto чтобы не растягивались по-разному. */
+.chap-manage { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px;
+  padding-bottom: 8px; border-bottom: 1px dashed var(--line, rgba(255,255,255,0.1)); }
+.chap-manage button { flex: 0 0 auto; }
+/* drag-and-drop + ручка перетаскивания */
+.chap-head-row { display: flex; align-items: center; gap: 2px; }
+.chap-head-row .chap-head { flex: 1; }
+/* объём/счётчик слов на уровне шапки главы */
+.chap-head-words { display: flex; align-items: center; gap: 6px; padding: 0 8px 0 6px;
+  font-size: 12px; color: var(--muted); white-space: nowrap; }
+.chap-head-words input { width: 64px; padding: 4px 6px; font-size: 12px; }
+.chap-head-words .cw-unit { color: var(--muted); }
+.chap-head-words .cw-count { color: var(--paper-dim); border-left: 1px solid var(--line);
+  padding-left: 6px; }
+.drag-handle { display: flex; align-items: center; padding: 0 4px; cursor: grab;
+  color: var(--muted); opacity: 0.55; }
+.drag-handle:hover { opacity: 1; color: var(--ink); }
+.drag-handle:active { cursor: grabbing; }
+.card.chapter.dragging { opacity: 0.5; }
+.card.chapter.drag-over { outline: 2px dashed var(--ember, #c98); outline-offset: 2px; }
+/* редактируемое название главы */
+.chap-title-input { width: 100%; margin-bottom: 10px; }
+/* редактируемый логлайн */
+.logline-edit { width: 100%; resize: vertical; min-height: 42px; }
+/* #3: подсказка-строка по боту */
+.bot-hint { display: flex; align-items: flex-start; gap: 6px; margin: 0 0 10px;
+  padding: 7px 10px; font-size: 12px; line-height: 1.45; color: var(--muted);
+  background: rgba(120,160,210,0.08); border: 1px solid rgba(120,160,210,0.18);
+  border-radius: 7px; }
+.bot-hint svg { flex: none; margin-top: 2px; color: var(--ember, #c98); }
+button.xs.danger { color: #e88; }
+button.xs.danger:hover:not(:disabled) { background: rgba(220,80,80,0.14); border-color: #c66; }
 
 /* ---------- live-генерация: блок-плейсхолдер «ИИ пишет…» ---------- */
 .gencard { border-style: dashed; }
@@ -655,3 +688,35 @@ textarea.tall { height: 72vh; min-height: 320px; }
 .tr-out { margin-top: 8px; padding: 10px 12px; border: 1px dashed var(--line2);
   border-radius: 8px; background: var(--ink2); color: var(--paper-dim);
   font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+
+/* ---------- вкладки (Конвейер / Ассистент) ---------- */
+.tabbar { display: flex; gap: 6px; margin-bottom: 18px; border-bottom: 1px solid var(--line); }
+.tab { background: transparent; border: none; border-bottom: 2px solid transparent;
+  color: var(--muted); padding: 8px 14px; font-size: 13px; font-weight: 600;
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer; border-radius: 0; }
+.tab:hover { color: var(--paper); }
+.tab.active { color: var(--ember); border-bottom-color: var(--ember); }
+
+/* ---------- ассистент проекта ---------- */
+.asst { display: flex; flex-direction: column; gap: 12px; height: calc(100vh - 150px);
+  min-height: 480px; }
+.asst-head { display: flex; align-items: center; gap: 8px; font-weight: 700;
+  color: var(--paper); font-size: 15px; }
+.asst-head .asst-sub { font-weight: 400; font-size: 12px; color: var(--muted); margin-left: 4px; }
+.asst-thread { flex: 1; overflow-y: auto; display: flex; flex-direction: column;
+  gap: 10px; padding: 14px; background: var(--ink2); border: 1px solid var(--line);
+  border-radius: 12px; }
+.asst-empty { color: var(--muted); font-size: 13px; line-height: 1.6; margin: auto;
+  max-width: 460px; text-align: center; }
+.asst-thread .ch-msg { max-width: 78%; white-space: pre-wrap; line-height: 1.5; }
+.asst-err { color: #e88; font-size: 13px; padding: 2px 4px; }
+.asst-note { color: var(--sage); font-size: 13px; display: flex; align-items: center;
+  gap: 6px; padding: 2px 4px; }
+.asst-apply { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px 12px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; }
+.asst-apply .lbl { font-size: 12px; color: var(--muted); }
+.asst-apply select { background: var(--ink2); color: var(--paper);
+  border: 1px solid var(--line2); border-radius: 7px; padding: 6px 8px; font-size: 13px; }
+.asst-input { display: flex; gap: 8px; }
+.asst-input textarea { flex: 1; }

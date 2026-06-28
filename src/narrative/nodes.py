@@ -179,10 +179,81 @@ def _sys(state: State, base: str, names: bool = False,
 
 
 def _loc_block(state: State) -> str:
-    """Блок канон-локаций для контекста (пусто, если бот локаций не отработал)."""
+    """Блок локаций для контекста (пусто, если бот локаций не отработал)."""
     loc = (state.get("locations") or "").strip()
-    return (f"\n\nЛокации (канон — используй эти места и их CamelCase-теги "
+    return (f"\n\nЛокации (используй эти места и их CamelCase-теги "
             f"для статиков):\n{loc}") if loc else ""
+
+
+def _story_context(state: State, idx: int, max_prev: int = 4) -> str:
+    """Полный контекст для написания/правки главы #5/#6: синопсис + последние
+    предыдущие главы (план + хвост написанного текста) — чтобы держать
+    непрерывность и не повторяться."""
+    parts: list[str] = []
+    syn = (state.get("synopsis") or "").strip()
+    if syn:
+        parts.append(f"Синопсис:\n{syn}")
+    chs = list(state.get("chapters") or [])
+    prev = [c for c in chs if c.index < idx][-max_prev:]
+    if prev:
+        blocks = []
+        for c in prev:
+            b = f"Глава {c.index + 1}: {c.title}\nПлан:\n{c.plan}"
+            if c.dialogue:
+                b += f"\nКонцовка написанного: …{c.dialogue.strip()[-400:]}"
+            blocks.append(b)
+        parts.append("Предыдущие главы (контекст — держи непрерывность, НЕ "
+                     "повторяй и НЕ переписывай их):\n\n" + "\n\n".join(blocks))
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
+def _all_chapters_context(state: State, current_idx: int | None = None) -> str:
+    """Полный контекст ВСЕХ глав (план + текст), даже пустых — для чата/помощи
+    по конкретной главе. Текущая глава помечена явно, чтобы ИИ не путал, о какой
+    речь."""
+    chs = sorted(state.get("chapters") or [], key=lambda c: c.index)
+    if not chs:
+        return ""
+    blocks = []
+    for c in chs:
+        mark = "  ◀◀ ТЕКУЩАЯ ГЛАВА (о ней идёт речь)" if c.index == current_idx else ""
+        plan = (c.plan or "").strip() or "(план пуст)"
+        dlg = (c.dialogue or "").strip() or "(текст ещё не написан)"
+        blocks.append(
+            f"=== Глава {c.index + 1}: {c.title}{mark} ===\n"
+            f"ПЛАН:\n{plan}\n\nТЕКСТ:\n{dlg}"
+        )
+    return ("Все главы по порядку повествования (планы и тексты — для контекста; "
+            "глава 1 идёт первой):\n\n" + "\n\n".join(blocks))
+
+
+def gen_chapter_plan(state: State, idx: int) -> str:
+    """Сгенерировать ИИ план для ОДНОЙ (обычно пустой) главы idx по контексту
+    всех глав. Возвращает текст плана разделами."""
+    chapters = sorted(state.get("chapters") or [], key=lambda c: c.index)
+    if not (0 <= idx < len(chapters)):
+        return ""
+    cur = chapters[idx]
+    ctx = (f"Карточки:\n{state.get('characters', '')}" + _loc_block(state)
+           + "\n\n" + _all_chapters_context(state, idx)
+           + f"\n\nСгенерируй план ТОЛЬКО для главы {idx + 1} "
+           f"«{cur.title}» — она должна логично встать по порядку среди "
+           "остальных (без дыр и повторов с соседними). Верни РОВНО ОДИН "
+           "объект в массиве chapters.")
+    system = _sys(state, prompts.STRUCTURE, names=True, stage="structure")
+    try:
+        plan = _structural(state, "structure").structured(
+            system + prompts.STRUCTURE_JSON_SUFFIX, ctx, StructurePlan,
+            temperature=0.7)
+        c = plan.chapters[0]
+        plan_text = c.plan
+        if c.adult_note:
+            plan_text = f"{plan_text}\n\n[ADULT POINT: {c.adult_note}]"
+        return plan_text
+    except LLMLimitError:
+        raise
+    except Exception:
+        return cur.plan or ""
 
 
 # ---------- Боты 1-4: линейная часть ----------
@@ -305,7 +376,7 @@ def _gen_chapter_batch(state: State, start: int, n: int) -> tuple[list[Chapter],
         # Адалт — в КАЖДОЙ главе (по умолчанию). Решение бота игнорим; пару
         # подсказывает adult_note. Вручную главу можно сделать неадалт в UI.
         if note:  # подсказку «кто с кем» кладём в план — её увидит Бот 6
-            plan_text = f"{plan_text}\n\n[Адалт-точка: {note}]"
+            plan_text = f"{plan_text}\n\n[ADULT POINT: {note}]"
         new.append(Chapter(
             index=start + i, title=title, plan=plan_text,
             is_adult_point=True, adult_note=note or "",
@@ -446,7 +517,7 @@ def _gen_full_structure(state: State, target: int) -> list[Chapter]:
     chapters: list[Chapter] = []
     for i, (title, plan_text, _is_adult, note) in enumerate(full):
         if note:  # адалт в каждой главе (по умолчанию)
-            plan_text = f"{plan_text}\n\n[Адалт-точка: {note}]"
+            plan_text = f"{plan_text}\n\n[ADULT POINT: {note}]"
         chapters.append(Chapter(
             index=i, title=title, plan=plan_text,
             is_adult_point=True, adult_note=note or "",
@@ -461,15 +532,13 @@ def gen_inserted_chapter(state: State, after_idx: int) -> Chapter:
     Индекс выставит вызывающий код после вставки/переиндексации.
     """
     chapters = list(state.get("chapters") or [])
-    before = chapters[after_idx] if 0 <= after_idx < len(chapters) else None
     after = chapters[after_idx + 1] if after_idx + 1 < len(chapters) else None
     around = ""
-    if before:
-        around += f"\n\nПРЕДЫДУЩАЯ глава {before.index + 1}: {before.title}\n{before.plan}"
     if after:
         around += f"\n\nСЛЕДУЮЩАЯ глава {after.index + 1}: {after.title}\n{after.plan}"
-    ctx = (f"Синопсис:\n{state.get('synopsis', '')}\n\n"
-           f"Карточки:\n{state.get('characters', '')}" + _loc_block(state)
+    # #6: новая глава видит содержимое предыдущих глав (план + хвост текста)
+    ctx = (f"Карточки:\n{state.get('characters', '')}" + _loc_block(state)
+           + _story_context(state, after_idx + 1)
            + around
            + "\n\nСгенерируй РОВНО ОДНУ новую главу, которая логично встаёт "
            "между предыдущей и следующей (плавный переход, без дыр и повторов). "
@@ -482,7 +551,7 @@ def gen_inserted_chapter(state: State, after_idx: int) -> Chapter:
         c = plan.chapters[0]
         plan_text = c.plan
         if c.adult_note:  # все главы адалт
-            plan_text = f"{plan_text}\n\n[Адалт-точка: {c.adult_note}]"
+            plan_text = f"{plan_text}\n\n[ADULT POINT: {c.adult_note}]"
         return Chapter(index=after_idx + 1, title=c.title, plan=plan_text,
                        is_adult_point=True,
                        adult_note=c.adult_note or "")
@@ -740,6 +809,7 @@ def write_chapter(state: State, ch: Chapter, idx: int,
 
     base = (
         f"Карточки персонажей:\n{state['characters']}" + _loc_block(state)
+        + _story_context(state, idx)
         + f"\n\nНомер этой главы для тегов статиков (NN): {idx + 1:02d}\n\n"
         f"Глава для написания:\n{ch.title}\n{ch.plan}"
     )
