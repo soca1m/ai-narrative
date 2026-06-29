@@ -91,6 +91,12 @@ class Run:
     error: str = ""  # текст последней ошибки воркера (для UI)
     limit: Optional[dict] = None  # инфо об исчерпании лимита (#5): баннер выбора
     gen: Optional[dict] = None  # live-партиал текущей генерации {stage, idx, text}
+    cancel: bool = False  # запрос остановки текущей генерации (любой этап)
+    structure_dirty: bool = False  # главы менялись вручную → предложить проверку
+
+
+class _Cancelled(Exception):
+    """Внутренний сигнал: нарративщик нажал «Стоп» — мягко прерываем генерацию."""
 
 
 RUNS: dict[str, Run] = {}
@@ -136,19 +142,28 @@ def _bg_op(run: Run, fn, stage: str | None = None,
     (paused/done), ошибку кладём в run.error, прогресс в чекпоинте цел."""
     from narrative import live  # noqa: PLC0415
     prev = run.status if run.status in ("paused", "done") else "paused"
+    # СИНХРОННО ставим running ДО старта потока — иначе немедленный poll фронта
+    # ловит ещё «paused» (гонка) и перестаёт поллить → правка видна лишь после F5.
+    run.cancel = False
+    run.status = "running"
+    run.error = ""
 
     def _worker():
-        run.status = "running"
-        run.error = ""
         if stage:
             run.gen = {"stage": stage, "idx": idx, "text": ""}
             def _sink(_stage, _idx, text):  # стрим ревизии во фронт
+                if run.cancel:
+                    raise _Cancelled()
                 run.gen = {"stage": stage, "idx": idx, "text": text}
                 run.events.put({"type": "gen", "stage": stage, "idx": idx, "text": text})
             live.bind(_sink, stage, idx)
         run.events.put({"type": "status", "status": "running"})
         try:
             fn()
+            run.status = prev
+            run.events.put({"type": "status", "status": prev})
+        except _Cancelled:  # «Стоп» во время ручной операции
+            run.cancel = False
             run.status = prev
             run.events.put({"type": "status", "status": prev})
         except LLMLimitError as exc:  # #5: лимит → баннер выбора, прогресс цел
@@ -196,10 +211,13 @@ def _run_worker(run: Run, _graph_unused, stream_input):
     продолжаем. Так тумблер пошагового режима работает НА ЛЕТУ."""
     # live-стрим: узлы графа шлют нарастающий текст сюда → во фронт (poll/SSE)
     def _on_delta(stage, idx, text):
+        if run.cancel:  # «Стоп» во время стрима → прерываем LLM немедленно
+            raise _Cancelled()
         run.gen = {"stage": stage, "idx": idx, "text": text}
         run.events.put({"type": "gen", "stage": stage, "idx": idx, "text": text})
     cfg = {"configurable": {"thread_id": run.thread_id, "on_delta": _on_delta}}
     graph = _GRAPH_STEP
+    run.cancel = False
     run.status = "running"
     run.error = ""  # новый прогон → чистим прошлую ошибку
     run.events.put({"type": "status", "status": "running"})
@@ -220,12 +238,21 @@ def _run_worker(run: Run, _graph_unused, stream_input):
                 run.status = "done"
                 run.events.put({"type": "status", "status": "done"})
                 return
-            if run.step_mode:  # пауза-точка + пошаговый → ждём юзера
+            if run.cancel or run.step_mode:  # «Стоп» или пошаговый → пауза, ждём юзера
+                run.cancel = False
                 run.status = "paused"
                 run.events.put({"type": "status", "status": "paused",
                                 "next": list(snap.next)})
                 return
             inp = None  # авто-режим → продолжаем со следующей стадии
+    except _Cancelled:  # «Стоп» посреди этапа → встаём на паузу, прогресс цел
+        run.gen = None
+        run.cancel = False
+        run.status = "paused"
+        snap = graph.get_state(cfg)
+        run.events.put({"type": "status", "status": "paused",
+                        "next": list(snap.next)})
+        return
     except LLMLimitError as exc:  # #5: лимит провайдера исчерпан → спросить юзера
         run.gen = None
         limit = {"provider": exc.provider, "reset_at": exc.reset_at,
@@ -268,6 +295,7 @@ class StartReq(BaseModel):
     step_mode: bool = True
     chapter_model: Optional[str] = None  # модель для глав (Бот 5, не-адалт)
     default_words: int = 0               # цель слов/главу (0 → дефолт конфига)
+    prompt_overrides: Optional[dict] = None  # dev-оверрайды промптов до старта
 
 
 class PatchReq(BaseModel):
@@ -316,6 +344,11 @@ def start_run(req: StartReq):
         "chapter_model": req.chapter_model,
         "default_words": req.default_words or CHAPTER_WORDS_DEFAULT,
     }
+    # dev-оверрайды промптов, заданные ДО старта (применяются с первого бота)
+    if req.prompt_overrides:
+        init["prompt_overrides"] = {
+            k: v for k, v in req.prompt_overrides.items() if (v or "").strip()
+        }
     run.worker = threading.Thread(
         target=_run_worker, args=(run, _graph(run), init), daemon=True)
     run.worker.start()
@@ -328,6 +361,7 @@ def get_state(thread_id: str):
     snap = _graph(run).get_state(_config(thread_id))
     return {"status": run.status, "next": list(snap.next),
             "error": run.error, "limit": run.limit, "gen": run.gen,
+            "structure_dirty": run.structure_dirty,
             "state": _serialize(snap.values or {})}
 
 
@@ -389,6 +423,20 @@ def resume_run(thread_id: str):
         target=_run_worker, args=(run, None, None), daemon=True)
     run.worker.start()
     return {"ok": True}
+
+
+@app.post("/api/runs/{thread_id}/stop")
+def stop_run(thread_id: str):
+    """Остановить генерацию на ЛЮБОМ этапе: ставим флаг — воркер мягко встаёт на
+    паузу (на стрим-этапах сразу, на остальных — по завершении текущего бота).
+    Прогресс сохранён, можно продолжить кнопкой «Продолжить»."""
+    run = _get_run(thread_id)
+    if run.worker and run.worker.is_alive():
+        run.cancel = True
+    else:
+        run.status = "paused"
+        run.events.put({"type": "status", "status": "paused"})
+    return {"ok": True, "stopping": True}
 
 
 # ---------- #5: провайдер по этапам + разрешение лимита ----------
@@ -672,7 +720,9 @@ def restructure(thread_id: str, req: CountReq):
     def _op():
         st = _state(thread_id)
         st["target_chapters"] = n
+        st["manual_chapters"] = False  # явная пересборка → снимаем ручной режим
         result = nodes.structure_node(st)  # учитывает текущий план как опору
+        result["manual_chapters"] = False
         _patch(thread_id, run, result)
         run.events.put({"type": "edited", "keys": list(result.keys())})
 
@@ -704,6 +754,7 @@ def add_chapter(thread_id: str, req: AddChapterReq):
         for i, ch in enumerate(chapters):
             ch.index = i
         _patch(thread_id, run, {"chapters": chapters})
+        run.structure_dirty = True
         run.events.put({"type": "edited", "keys": ["chapters"]})
         return {"ok": True, "chapters": len(chapters), "new_index": after + 1}
 
@@ -719,6 +770,7 @@ def add_chapter(thread_id: str, req: AddChapterReq):
         for i, ch in enumerate(chapters):
             ch.index = i
         _patch(thread_id, run, {"chapters": chapters})
+        run.structure_dirty = True
         run.events.put({"type": "edited", "keys": ["chapters"]})
 
     return _bg_op(run, _op)
@@ -751,8 +803,16 @@ def manual_structure(thread_id: str):
     ch = Chapter(index=0, title="Глава 1", plan="", is_adult_point=True,
                  adult_note="")
     patch = {"chapters": [ch], "target_chapters": 1, "structure_done": True,
-             "structure_fixes": [], "phase": "content", "chapter_idx": 0}
-    _patch(thread_id, run, patch, as_node="structure")
+             "structure_fixes": [], "phase": "content", "chapter_idx": 0,
+             "manual_chapters": True}
+    # manual_chapters=True → даже если граф вернётся на structure/structure_editor
+    # (напр. после ручной правки глав), эти узлы отработают вхолостую и НЕ затрут
+    # ручные главы. as_node="structure_editor" сразу ведёт к написанию.
+    try:
+        _patch(thread_id, run, patch, as_node="structure_editor")
+    except Exception:  # noqa: BLE001 — фолбэк, если граф не там
+        _patch(thread_id, run, patch)
+    run.structure_dirty = False
     run.status = "paused"
     run.error = ""
     run.events.put({"type": "edited", "keys": ["chapters"]})
@@ -779,6 +839,7 @@ def delete_chapter(thread_id: str, idx: int):
     if cur >= len(chapters):
         patch["chapter_idx"] = len(chapters) - 1
     _patch(thread_id, run, patch)
+    run.structure_dirty = True
     run.events.put({"type": "edited", "keys": ["chapters"]})
     return {"ok": True, "chapters": len(chapters)}
 
@@ -828,6 +889,51 @@ def move_chapter(thread_id: str, idx: int, req: MoveReq):
     _patch(thread_id, run, {"chapters": chapters})
     run.events.put({"type": "edited", "keys": ["chapters"]})
     return {"ok": True, "moved_to": j}
+
+
+@app.post("/api/runs/{thread_id}/structure/check")
+def check_structure(thread_id: str):
+    """Проверка структуры (бот-редактор) после ручных изменений глав. Чинит
+    нестыковки плана. Снимает флаг structure_dirty."""
+    run = _get_run(thread_id)
+    _busy(run)
+    run.structure_dirty = False
+
+    def _op():
+        st = _state(thread_id)
+        result = nodes.structure_editor_node(st)
+        _patch(thread_id, run, result)
+        run.events.put({"type": "edited", "keys": list(result.keys())})
+
+    return _bg_op(run, _op, stage="structure_editor")
+
+
+@app.post("/api/runs/{thread_id}/structure/skip_check")
+def skip_structure_check(thread_id: str):
+    """Пропустить проверку структуры — просто снять флаг."""
+    run = _get_run(thread_id)
+    run.structure_dirty = False
+    run.events.put({"type": "status", "status": run.status})
+    return {"ok": True}
+
+
+@app.post("/api/runs/{thread_id}/structure/skip_stage")
+def skip_structure_stage(thread_id: str):
+    """Пропустить ЭТАП проверки структуры в пайплайне (узел structure_editor) —
+    не запускать редактора, сразу перейти к написанию глав."""
+    run = _get_run(thread_id)
+    _busy(run)
+    run.structure_dirty = False
+    # помечаем узел выполненным без правок → граф идёт к следующему шагу (главы).
+    # Фолбэк: если граф не на узле проверки — ставим одноразовый флаг пропуска,
+    # тогда узел отработает вхолостую (без 500 и без перезаписи плана).
+    try:
+        _patch(thread_id, run, {"structure_fixes": [],
+                                "skip_structure_check": True},
+               as_node="structure_editor")
+    except Exception:  # noqa: BLE001
+        _patch(thread_id, run, {"skip_structure_check": True})
+    return resume_run(thread_id)
 
 
 # ---------- объём главы (слова) + «растянуть» ----------

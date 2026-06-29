@@ -443,10 +443,17 @@ def _is_filler_chapter(title: str, plan: str) -> bool:
 def structure_node(state: State) -> dict:
     """Бот 4 — пишет структуру РОВНО на утверждённое число глав (target_chapters).
 
+    Если нарративщик задал главы вручную (manual_chapters) — НЕ перегенерируем:
+    его главы первичны, иначе «Продолжить» затёр бы ручную работу.
+
     Генерим всю дугу ОДНИМ заходом (STRUCTURE_FULL_SUFFIX) — модель сама
     распределяет сюжет на N глав, не оставляя глав-заглушек. Заглушки/отказы
     отфильтровываем, недобор добираем порциями, перебор обрезаем.
     """
+    if state.get("manual_chapters") and (state.get("chapters")):
+        return {"chapter_idx": 0, "phase": "content", "structure_done": True,
+                "log": ["· Структура задана вручную — генерация пропущена"]}
+
     target = int(state.get("target_chapters")
                  or state.get("suggested_chapters") or _DEFAULT_CHAPTERS)
     target = max(2, min(target, _MAX_CHAPTERS))
@@ -572,6 +579,10 @@ def structure_editor_node(state: State) -> dict:
     chapters = list(state.get("chapters") or [])
     if not chapters:
         return {"log": ["· Редактор структуры: глав нет, пропуск"]}
+    # ручные главы или явный пропуск нарративщиком → не трогаем план
+    if state.get("manual_chapters") or state.get("skip_structure_check"):
+        return {"skip_structure_check": False,
+                "log": ["· Проверка структуры пропущена — план не изменён"]}
 
     plan_text = "\n\n".join(
         f"Глава {c.index + 1}: {c.title}\n"

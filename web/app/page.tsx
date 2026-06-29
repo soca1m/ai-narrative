@@ -54,6 +54,10 @@ import {
   getState,
   patchState,
   resumeRun,
+  stopRun,
+  checkStructure,
+  skipStructureCheck,
+  skipStructureStage,
   reviseChapter,
   rewriteDialogue,
   syncPlan,
@@ -81,16 +85,16 @@ const STAGES: [string, string, string][] = [
 
 // что сейчас сгенерируется — для ghost-превью следующего этапа
 const STAGE_DESC: Record<string, string> = {
-  logline: "Бот придумает несколько вариантов логлайна — выберешь один.",
-  synopsis: "Развёрнутый синопсис на основе выбранного логлайна.",
-  characters: "Карточки персонажей: характер, мотивации, роль (без внешности).",
-  locations: "Карточки локаций: места действия, атмосфера, теги для художника.",
-  chapter_count: "ИИ оценит и предложит оптимальное число глав.",
-  structure: "Поглавный план: что в каждой главе + где адалт-точки.",
-  structure_editor: "Редактор проверит и сам починит план до написания.",
-  dialogue: "Бот напишет диалоги глав (адалт — внутри сцены).",
-  editor: "Редактор проверит готовые главы и предложит правки.",
-  translation: "Перевод глав на выбранный язык.",
+  logline: "ИИ придумает несколько коротких идей истории — выберешь одну.",
+  synopsis: "Подробный пересказ всей истории на основе выбранной идеи.",
+  characters: "Описания героев: характер, чего хотят, их роль в истории.",
+  locations: "Места, где будет происходить действие.",
+  chapter_count: "ИИ предложит, сколько глав лучше сделать.",
+  structure: "План истории по главам: что происходит в каждой.",
+  structure_editor: "ИИ проверит план и поправит нестыковки перед написанием.",
+  dialogue: "ИИ напишет текст глав — реплики героев.",
+  editor: "ИИ проверит готовые главы и предложит правки.",
+  translation: "Перевод глав на нужный язык.",
 };
 
 const BOT_NAME: Record<number, string> = {
@@ -98,20 +102,20 @@ const BOT_NAME: Record<number, string> = {
   5: "Диалоги", 6: "Адалт", 7: "Редактор", 8: "Перевод",
 };
 
-// #3: маленькие подсказки по каждому боту — как с ним работать.
+// #3: простые подсказки по каждому боту — человеческим языком, без технических деталей.
 const BOT_HINTS: Record<string, string> = {
-  logline: "Бот даёт несколько завязок. Выбери одну — она ляжет в основу всей "
-    + "истории. Правки пиши на русском: «мрачнее», «добавь любовную линию».",
-  synopsis: "Краткое содержание всей новеллы. Правь здесь тон и ключевые "
-    + "повороты ДО того, как пойдут главы — потом всё опирается на синопсис.",
-  characters: "Карточки о характере, мотивации и роли — НЕ о внешности. Имена "
-    + "и мотивации отсюда боты дальше не меняют. Правь через ИИ на русском.",
-  locations: "Места действия и их CamelCase-теги для художника (идут в статики "
-    + "глав). Кнопкой «изменить через ИИ» опиши правку на русском — бот перепишет.",
-  structure: "Поглавный план. У каждой главы: LOCATIONS, кто участвует, STORY "
-    + "(обычная часть) и отдельно ADULT SCENES. Главы можно двигать/добавлять/удалять.",
-  dialogue: "Главы репликами. Правь прямо в поле или попроси ИИ переписать на "
-    + "русском. «План → переписать диалоги» подгонит текст под изменённый план.",
+  logline: "Это короткая идея истории в одном-двух предложениях. Выбери ту, что "
+    + "нравится больше — на ней построится вся новелла. Не та? Попроси другие варианты.",
+  synopsis: "Краткий пересказ всей истории. Здесь удобно задать настроение и "
+    + "главные повороты. Если что-то не так — поправь текст сам или попроси ИИ.",
+  characters: "Описания героев: какие они по характеру, чего хотят, какую роль "
+    + "играют. Можно дописать или попросить ИИ изменить.",
+  locations: "Места, где происходит действие. Можно поправить вручную или "
+    + "попросить ИИ переписать.",
+  structure: "План истории по главам: что происходит в каждой и где будут "
+    + "горячие сцены. Главы можно добавлять, удалять и менять местами.",
+  dialogue: "Готовый текст главы — реплики героев. Правь прямо в поле или попроси "
+    + "ИИ переписать своими словами.",
 };
 
 // #3: строка-подсказка под шапкой бота
@@ -305,6 +309,9 @@ export default function Page() {
   const [countInput, setCountInput] = useState<number | "">("");
   const [reCount, setReCount] = useState<number | "">("");  // #7 пересборка
   const [tab, setTab] = useState<"pipeline" | "assistant">("pipeline");
+  // dev-оверрайды промптов ДО старта (применятся с первого бота)
+  const [preOverrides, setPreOverrides] = useState<Record<string, string>>({});
+  const [structureDirty, setStructureDirty] = useState(false);
 
   // список прошлых работ (продолжить оборванную / скачать)
   const [runs, setRuns] = useState<RunSummary[]>([]);
@@ -349,6 +356,7 @@ export default function Page() {
     const { thread_id } = await startRun({
       theme, genre: genre || undefined, target_language: lang,
       translation_enabled: translation, step_mode: stepMode,
+      prompt_overrides: Object.keys(preOverrides).length ? preOverrides : undefined,
     });
     setThreadId(thread_id);
     poll(thread_id);
@@ -364,6 +372,7 @@ export default function Page() {
         setErr(r.error || null);
         setLimit(r.limit || null);
         setGen(r.gen || null);
+        setStructureDirty(!!r.structure_dirty);
         setSt(r.state);
         syncDrafts(r.state);
         if (r.status === "running" || r.status === "idle")
@@ -385,6 +394,26 @@ export default function Page() {
     await resumeRun(threadId);
     setStatus("running");
     poll(threadId);
+  }
+  async function onStop() {
+    if (!threadId) return;
+    try { await stopRun(threadId); poll(threadId); }
+    catch (e) { setErr(e instanceof Error ? e.message : "Не удалось остановить"); }
+  }
+  async function onCheckStructure() {
+    if (!threadId) return;
+    try { setErr(null); await checkStructure(threadId); setStatus("running"); poll(threadId); }
+    catch (e) { setErr(e instanceof Error ? e.message : "Не удалось проверить структуру"); }
+  }
+  async function onSkipStructureCheck() {
+    if (!threadId) return;
+    try { await skipStructureCheck(threadId); setStructureDirty(false); refresh(); }
+    catch (e) { setErr(e instanceof Error ? e.message : "Ошибка"); }
+  }
+  async function onSkipStructureStage() {
+    if (!threadId) return;
+    try { setErr(null); await skipStructureStage(threadId); setStatus("running"); poll(threadId); }
+    catch (e) { setErr(e instanceof Error ? e.message : "Не удалось пропустить проверку"); }
   }
 
   function refresh() { if (threadId) poll(threadId); }
@@ -621,6 +650,13 @@ export default function Page() {
         </div>
         <ClaudeSubPanel />
 
+        {!threadId && (
+          <PromptDevPanel overrides={preOverrides}
+            onLocalChange={(s, t) => setPreOverrides((o) => {
+              const n = { ...o }; if (t) n[s] = t; else delete n[s]; return n;
+            })} />
+        )}
+
         <button className="wide" onClick={onStart} disabled={busy}>
           {threadId ? <><Plus size={16} /> Новая работа</>
                     : <><Play size={16} /> Запустить пайплайн</>}
@@ -704,6 +740,10 @@ export default function Page() {
                   : curEdited
                   ? `правка главы ${curIdx + 1}`
                   : nextLabel(next).toLowerCase()}
+                <button className="small ghost" style={{ marginLeft: "auto" }}
+                  onClick={onStop} title="Остановить генерацию (прогресс сохранится)">
+                  <Pause size={14} /> Стоп
+                </button>
               </div>
             )}
             {status === "paused" && !pausedAtCount && !gating && (
@@ -711,6 +751,13 @@ export default function Page() {
                 {curEdited
                   ? <><Check size={16} /> Глава {curIdx + 1} готова — следующая</>
                   : <><ArrowRight size={16} /> Продолжить · {nextLabel(next)}</>}
+              </button>
+            )}
+            {status === "paused" && !pausedAtCount && !gating && next[0] === "structure_editor" && (
+              <button className="wide secondary" style={{ marginTop: 8 }}
+                onClick={onSkipStructureStage}
+                title="Не запускать проверку структуры — сразу перейти к написанию глав">
+                Пропустить проверку — к написанию глав
               </button>
             )}
             {gating && (
@@ -908,6 +955,17 @@ export default function Page() {
             {/* Порядок убывания: свежие результаты сверху (главы → персонажи → синопсис → логлайн) */}
             {showGen("structure") && <GenCard bot="06" title="Структура · поглавный план" rows={5} live={liveFor("structure")} />}
 
+            {structureDirty && !busy && (
+              <div className="struct-check">
+                <div className="sc-t"><ScanSearch size={15} /> Структура изменилась</div>
+                <div className="sc-d">Главы добавлены/удалены. Запустить проверку структуры (ИИ выровняет план и связки) или пропустить?</div>
+                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                  <button className="small" onClick={onCheckStructure}><ScanSearch size={14} /> Проверить структуру</button>
+                  <button className="small ghost" onClick={onSkipStructureCheck}>Пропустить</button>
+                </div>
+              </div>
+            )}
+
             <Chapters
               onAddChapter={onAddChapter}
               onGenChapterPlan={onGenChapterPlan}
@@ -928,8 +986,8 @@ export default function Page() {
               chapters={st.chapters ?? []}
               reports={reports}
               onSaveAll={(chs) => guard(async () => { if (threadId) { await patchState(threadId, { chapters: chs }); refresh(); } })}
-              onReviseChapter={(i, fb) => guard(async () => { if (threadId) { await reviseChapter(threadId, i, fb); refresh(); } })}
-              onReviseDialogue={(i, fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "dialogue", fb, i); refresh(); } })}
+              onReviseChapter={(i, fb) => guard(async () => { if (threadId) { await reviseChapter(threadId, i, fb); setStatus("running"); poll(threadId); } })}
+              onReviseDialogue={(i, fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "dialogue", fb, i); setStatus("running"); poll(threadId); } })}
               onRewriteDialogue={(i) => guard(async () => { if (threadId) { await rewriteDialogue(threadId, i); refresh(); } })}
               onSyncPlan={(i) => guard(async () => { if (threadId) { await syncPlan(threadId, i); refresh(); } })}
               rollbackStage={currentStage === "dialogue" ? "dialogue" : currentStage === "structure" ? "structure" : null}
@@ -946,7 +1004,7 @@ export default function Page() {
               title="Локации · места действия" bot="04" rows={10} valKey="locations" busy={busy} hint={BOT_HINTS.locations}
               value={drafts.locations ?? ""} dirty={dirty.has("locations")} saved={saved === "locations"}
               onChange={(v) => edit("locations", v)} onSave={() => save("locations")}
-              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "locations", fb); refresh(); } })}
+              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "locations", fb); setStatus("running"); poll(threadId); } })}
               onRollback={currentStage === "locations" ? () => guard(async () => { if (threadId && confirm("Откатить этап локаций: удалить карточки локаций и сгенерировать заново?")) { await rollback(threadId, "locations"); refresh(); } }) : undefined}
             />
 
@@ -956,7 +1014,7 @@ export default function Page() {
               title="Персонажи · карточки" bot="03" rows={12} valKey="characters" busy={busy} hint={BOT_HINTS.characters}
               value={drafts.characters ?? ""} dirty={dirty.has("characters")} saved={saved === "characters"}
               onChange={(v) => edit("characters", v)} onSave={() => save("characters")}
-              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "characters", fb); refresh(); } })}
+              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "characters", fb); setStatus("running"); poll(threadId); } })}
               onRollback={currentStage === "characters" ? () => guard(async () => { if (threadId && confirm("Откатить этап персонажей: удалить карточки и сгенерировать заново?")) { await rollback(threadId, "characters"); refresh(); } }) : undefined}
             />
 
@@ -966,7 +1024,7 @@ export default function Page() {
               title="Синопсис" bot="02" rows={10} valKey="synopsis" busy={busy} hint={BOT_HINTS.synopsis}
               value={drafts.synopsis ?? ""} dirty={dirty.has("synopsis")} saved={saved === "synopsis"}
               onChange={(v) => edit("synopsis", v)} onSave={() => save("synopsis")}
-              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "synopsis", fb); refresh(); } })}
+              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "synopsis", fb); setStatus("running"); poll(threadId); } })}
               onRollback={currentStage === "synopsis" ? () => guard(async () => { if (threadId && confirm("Откатить этап синопсиса: удалить синопсис и сгенерировать заново?")) { await rollback(threadId, "synopsis"); refresh(); } }) : undefined}
             />
 
@@ -978,7 +1036,7 @@ export default function Page() {
               busy={busy}
               onSelect={(l) => guard(async () => { if (threadId) { await selectLogline(threadId, l); refresh(); } })}
               onSave={(list, sel) => guard(async () => { if (threadId) { await patchState(threadId, { loglines: list, selected_logline: sel }); refresh(); } })}
-              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "logline", fb); refresh(); } })}
+              onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "logline", fb); setStatus("running"); poll(threadId); } })}
             />
           </>
         )}
@@ -1002,6 +1060,21 @@ function AssistantTab({ threadId, busy, chapters, onRefresh }: {
   const [note, setNote] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
+  // чат закреплён за thread_id: грузим из localStorage при смене работы / релоаде
+  const lsKey = `asst:${threadId}`;
+  const loadedFor = useRef<string | null>(null);
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(lsKey);
+      setMsgs(raw ? JSON.parse(raw) : []);
+    } catch { setMsgs([]); }
+    loadedFor.current = threadId;
+  }, [threadId, lsKey]);
+  useEffect(() => {
+    // сохраняем только после того как загрузили историю текущего thread_id
+    if (loadedFor.current !== threadId) return;
+    try { localStorage.setItem(lsKey, JSON.stringify(msgs)); } catch { /* quota */ }
+  }, [msgs, threadId, lsKey]);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs, sending]);
 
   const needsChapter = target === "chapter_plan" || target === "chapter_dialogue";
@@ -1124,8 +1197,9 @@ function GenCard({ bot, title, rows = 4, live }: { bot: string; title: string; r
 }
 
 // #4 (dev): свёрнутая панель редактирования системных промптов по шагам
-function PromptDevPanel({ threadId, overrides, onChanged }: {
-  threadId: string; overrides: Record<string, string>; onChanged: () => void;
+function PromptDevPanel({ threadId, overrides, onChanged, onLocalChange }: {
+  threadId?: string; overrides: Record<string, string>; onChanged?: () => void;
+  onLocalChange?: (stage: string, text: string | null) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [defs, setDefs] = useState<Record<string, string> | null>(null);
@@ -1143,14 +1217,19 @@ function PromptDevPanel({ threadId, overrides, onChanged }: {
   async function save() {
     if (!stage) return;
     setBusy(true);
-    try { await setPromptOverride(threadId, stage, text); onChanged(); }
-    finally { setBusy(false); }
+    try {
+      if (threadId) { await setPromptOverride(threadId, stage, text); onChanged?.(); }
+      else onLocalChange?.(stage, text);
+    } finally { setBusy(false); }
   }
   async function reset() {
     if (!stage) return;
     setBusy(true);
-    try { await setPromptOverride(threadId, stage, ""); setText(defs?.[stage] ?? ""); onChanged(); }
-    finally { setBusy(false); }
+    try {
+      if (threadId) { await setPromptOverride(threadId, stage, ""); onChanged?.(); }
+      else onLocalChange?.(stage, null);
+      setText(defs?.[stage] ?? "");
+    } finally { setBusy(false); }
   }
   const stages = defs ? Object.keys(defs) : [];
   return (
@@ -1163,8 +1242,9 @@ function PromptDevPanel({ threadId, overrides, onChanged }: {
       {open && (
         <div style={{ marginTop: 8 }}>
           <div className="sp-hint">
-            Системный промпт каждого бота. Оверрайд хранится на этот прогон;
-            пусто/сброс → дефолт.
+            Системный промпт каждого бота. {threadId
+              ? "Оверрайд хранится на этот прогон; пусто/сброс → дефолт."
+              : "Задай ДО старта — применится с первого бота (вкл. логлайн)."}
           </div>
           <select className="model-select" value={stage}
             onChange={(e) => pick(e.target.value)}>
@@ -1608,8 +1688,10 @@ function Chapters(props: {
               )}
               <ReviseBox label="Попросить ИИ изменить план главы" disabled={props.busy} onRevise={(fb) => props.onReviseChapter(i, fb)} />
             </div>
-            <ChatBox threadId={props.threadId} chapterIdx={i} title="Обсудить главу с ИИ"
-              disabled={props.busy} onApplied={props.onRefresh} />
+            <ChatBox threadId={props.threadId} chapterIdx={i}
+              discussOnly title="Обсудить главу с ИИ"
+              hint="Обсуди главу целиком — план и текст (если он есть): задай вопрос, попроси совет или варианты. Ничего не меняется автоматически; правки вноси кнопкой «Попросить ИИ изменить»."
+              disabled={props.busy} />
 
             {c.dialogue == null && props.writingIdx === i && (
               <div className="geninline">
@@ -1748,9 +1830,11 @@ function RevisionPanel({
 // ---------- чат с ИИ-редактором: память (localStorage) + применить к главе ----------
 function ChatBox({
   threadId, chapterIdx, findingId, title, onApplied, storageKey, disabled,
+  discussOnly, hint,
 }: {
   threadId: string; chapterIdx?: number; findingId?: string; title: string;
   onApplied?: () => void; storageKey?: string; disabled?: boolean;
+  discussOnly?: boolean; hint?: string;
 }) {
   // storageKey задан → чат привязан к конкретной ревизии (своя память),
   // применение делает RevisionPanel, поэтому кнопку «применить к главе» прячем.
@@ -1820,7 +1904,7 @@ function ChatBox({
       </div>
       <div className="ch-msgs" ref={boxRef}>
         {msgs.length === 0 && (
-          <div className="ch-hint">Обсуди правку: «как лучше переписать сцену?», «согласен с замечанием?», «предложи 2 варианта реплики». Потом можно применить обсуждённое к главе.</div>
+          <div className="ch-hint">{hint ?? "Обсуди правку: «как лучше переписать сцену?», «согласен с замечанием?», «предложи 2 варианта реплики». Потом можно применить обсуждённое к главе."}</div>
         )}
         {msgs.map((m, i) => (
           <div key={i} className={`ch-msg ${m.role}`}>{m.content}</div>
@@ -1836,7 +1920,7 @@ function ChatBox({
           {busy ? <Loader2 size={15} className="spin" /> : <SendHorizontal size={15} />}
         </button>
       </div>
-      {!isRevisionChat && chapterIdx != null && msgs.length > 0 && (
+      {!isRevisionChat && !discussOnly && chapterIdx != null && msgs.length > 0 && (
         <button className="small secondary" style={{ margin: "0 12px 12px" }}
           disabled={busy || disabled} onClick={applyToChapter}
           title="ИИ внесёт согласованное в главу (или оставит как есть)">

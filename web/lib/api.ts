@@ -76,6 +76,7 @@ export type StartReq = {
   step_mode: boolean;
   chapter_model?: string;
   default_words?: number;   // цель слов/главу (0/пусто → дефолт ~3500)
+  prompt_overrides?: Record<string, string>;  // dev-оверрайды промптов до старта
 };
 
 // Безопасный разбор ответа: не падаем с «Unexpected token» на не-JSON
@@ -129,6 +130,7 @@ export async function getState(
 ): Promise<{ status: string; next: string[]; error?: string;
   limit?: LimitInfo | null;
   gen?: { stage: string; idx: number | null; text: string } | null;
+  structure_dirty?: boolean;
   state: NarrativeState }> {
   return jget(`/api/runs/${threadId}/state`);
 }
@@ -146,6 +148,13 @@ export async function patchState(
 }
 
 export const resumeRun = (id: string) => jpost(`/api/runs/${id}/resume`);
+// остановить генерацию на любом этапе (мягкая пауза, прогресс сохранён)
+export const stopRun = (id: string) => jpost(`/api/runs/${id}/stop`);
+// проверка структуры (бот) после ручных правок глав / пропустить проверку
+export const checkStructure = (id: string) => jpost(`/api/runs/${id}/structure/check`);
+export const skipStructureCheck = (id: string) => jpost(`/api/runs/${id}/structure/skip_check`);
+// пропустить ЭТАП проверки структуры в пайплайне → сразу к написанию глав
+export const skipStructureStage = (id: string) => jpost(`/api/runs/${id}/structure/skip_stage`);
 
 export const selectLogline = (id: string, logline: string) =>
   jpost(`/api/runs/${id}/select_logline`, { logline });

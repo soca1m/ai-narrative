@@ -720,3 +720,11 @@ textarea.tall { height: 72vh; min-height: 320px; }
   border: 1px solid var(--line2); border-radius: 7px; padding: 6px 8px; font-size: 13px; }
 .asst-input { display: flex; gap: 8px; }
 .asst-input textarea { flex: 1; }
+
+/* проверка структуры после ручных правок глав */
+.struct-check { margin: 12px 0; padding: 12px 14px; border-radius: 10px;
+  background: rgba(214,169,78,0.08); border: 1px solid rgba(214,169,78,0.3); }
+.struct-check .sc-t { display: flex; align-items: center; gap: 7px;
+  font-weight: 700; color: var(--gold); margin-bottom: 4px; }
+.struct-check .sc-d { font-size: 13px; color: var(--paper-dim); line-height: 1.5;
+  margin-bottom: 10px; }
