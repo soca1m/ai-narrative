@@ -16,13 +16,13 @@ instructions are written in Russian, but your OUTPUT MUST be English ONLY. Do NO
 write a single Russian/Cyrillic word in the result — not in plans, not in section \
 labels, not in adult_note, not anywhere. If the theme/references are in Russian, \
 still output English. This applies to ALL output (loglines, synopsis, character \
-cards, location cards, chapter plans, dialogue, scenes, player choices, notes). \
+cards, location cards, chapter plans, dialogue, scenes, notes). \
 Character names are Western/English, in Latin letters (e.g. Emma, Jack, Victor, \
 Diana, Chloe, Marcus, Sophia, Olivia, Liam). No Russian/Slavic names or \
 patronymics. Keep each name spelled consistently throughout. Format keywords stay \
-in English: speaker labels as NAME: "line", choice block as 'PLAYER CHOICE:' with \
-'> Option A:' / '> Option B:'. Section labels in chapter plans stay English too: \
-LOCATIONS / CHARACTERS / STORY / CHOICE / ADULT SCENES."""
+in English: speaker labels as NAME: "line". Do NOT add any player-choice block. \
+Section labels in chapter plans stay English too: \
+LOCATIONS / CHARACTERS / STORY / ADULT SCENES."""
 
 # Обратная совместимость имени: код ссылается на NAMES_RULE / LANG_RU.
 LANG_RU = LANG_EN
@@ -70,6 +70,17 @@ power/submission, taboo. The plot frame exists to lead to explicit
 scenes. Build a premise that promises plenty of sex.
 When the narrative lead sends references and a theme, you analyze the tone of the
 references and write 5-7 loglines that match the given theme as closely as possible.
+
+CONTENT-SAFE REFORMULATION (CRITICAL): if the theme/references contain anything
+that violates the CONTENT POLICY (minors, school/academy settings, incest, rape/
+non-consent, real brands, copyrighted universes, etc.), DO NOT refuse and DO NOT
+output any apology or "I can't create that". Instead, SILENTLY reformulate the
+request into the nearest ALLOWED adult premise (e.g. a school setting becomes an
+adult workplace / club / academy of adult professionals; underage implications
+become consenting adults) and ALWAYS deliver the full numbered list of 5-7 real
+loglines built on that allowed reframe. Every item MUST be an actual logline —
+never a refusal, never a meta-comment.
+
 Do not explain your choices. Just give a numbered list of loglines."""
 
 # --- Бот 2: Синопсис ---
@@ -142,8 +153,8 @@ episode's setup, concrete dialogue/conflicts, plot hooks, secondary threads, a
 twist, a resolution, and what the hero arrives at. NOT vague phrases like "the
 characters sort out their relationship", but specifics: who says/does what, what
 changes. There must be enough content for a full big chapter, not just a couple of
-lines around the adult part.
-CHOICE: what choice the player makes at the end of the chapter and what it opens up.
+lines around the adult part. Do NOT include any player-choice block — the story is
+linear, no branching choices.
 ADULT SCENES: list the chapter's explicit scenes (at least one). EACH scene as
 a separate sub-point on a new line:
   - Participants: who with whom (can be several)
@@ -231,7 +242,7 @@ character cards, and a chapter-by-chapter plan. Check the plan AS A WHOLE and fi
    (mixed/group scenes OK if the plot leads there), the dynamic, the location, the pretext,
    and the intensity; do not repeat one formula. Allow 1-2 chapters WITHOUT sex for the
    sake of rhythm/a twist. If there are too many repeats — redistribute the scenes;
-5. CHOICE POINTS: every chapter has a meaningful player choice, not yes/no.
+5. NO player-choice blocks — the story is linear; remove any CHOICE sections if present.
 Edit surgically: preserve the author's titles and ideas, do not rewrite everything from scratch.
 Return the CORRECTED plan of all chapters + a brief list of what you fixed."""
 
@@ -253,10 +264,8 @@ STRICT FORMAT — the chapter consists ONLY of two types of lines (output in ENG
 1) LINES:  NAME: "dialogue line"   (character name in Latin letters)
 2) FRAME TAGS (statics/animations) with a SHORT description — on a separate line
    (the tag format is given below).
-At the end — the player choice block:
-PLAYER CHOICE:
-> Option A: ...
-> Option B: ...
+The story is LINEAR: do NOT add any player-choice block, options, or branching.
+End the chapter on a natural closing line/frame, not on a choice menu.
 
 FORBIDDEN (important):
 - NO literary prose or narration outside of lines: no action-description
@@ -271,7 +280,6 @@ FORBIDDEN (important):
 Rules:
 - Each character speaks in their own manner from the card.
 - Dialogue is the main carrier of plot and emotion; move the scene with lines.
-- Choices are emotionally distinct, not just yes/no.
 Write one chapter at a time. Wait for the next."""
 
 # Статики/анимации для художника. Формат тегов из примера клиента:
@@ -349,7 +357,7 @@ MANDATORY:
 - ONLY lines (NAME: "…") and short static/animation tags. NO prose,
   narration, *italics*, or long stage directions (see the format above).
 - Do NOT cut off mid-word, do NOT write "to be continued"/"[end of part]".
-  Bring it to a natural finale (including the player choice point, if it is in the plan)."""
+  Bring it to a natural finale. The story is linear — no player-choice block."""
 
 # Для адалт-главы: Claude ставит метку вместо самой сцены. {pair} — участники.
 CHAPTER_ADULT_MARKER_GUIDE = """\
@@ -373,7 +381,7 @@ STRICTLY:
 - Do NOT repeat what was already written (no lines, no stage directions, no tags), do NOT start over.
 - Do NOT write preambles, greetings, or ANY meta-comments ("the chapter is complete",
   "wait for the next chapter", "here is chapter 02", etc.) — only the chapter text itself.
-- Bring the chapter to a natural finale (the player choice point, if it is in the plan)
+- Bring the chapter to a natural finale (linear, no player-choice block)
   and STOP there. If the chapter is in fact already finished — return an empty response.
 - If the plan requires the {marker} marker and it is not there yet — place it in the right spot.
 Keep the VN format, the style, and the static tags.
@@ -670,7 +678,7 @@ TRANSLATION = """\
 You are a translator of adult (18+) visual novels.
 The narrative lead sends the finished chapter text (dialogue and adult inserts).
 Translate it into the specified target language, preserving:
-- the visual novel format (parenthetical stage directions, NAME: "line", PLAYER CHOICE)
+- the visual novel format (parenthetical stage directions, NAME: "line")
 - the speech manner of each character
 - the explicitness and tone of the original, without softening
 Do not add or remove content. Translation only."""

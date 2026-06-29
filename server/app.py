@@ -95,8 +95,10 @@ class Run:
     structure_dirty: bool = False  # главы менялись вручную → предложить проверку
 
 
-class _Cancelled(Exception):
-    """Внутренний сигнал: нарративщик нажал «Стоп» — мягко прерываем генерацию."""
+class _Cancelled(BaseException):
+    """Сигнал «Стоп»: наследуем BaseException, чтобы НЕ быть проглоченным
+    `except Exception` (в live.feed-синке и ретраях LLM) — иначе отмена терялась
+    и кнопка «Стоп» не срабатывала на стрим-этапах."""
 
 
 RUNS: dict[str, Run] = {}
@@ -191,6 +193,37 @@ def _state(thread_id: str) -> dict:
     return dict(_graph(run).get_state(_config(thread_id)).values or {})
 
 
+# кэш перевода замечаний редактора EN→RU (для показа; правки в коде остаются EN)
+_findings_ru_cache: dict[str, str] = {}
+
+
+def _to_ru_display(text: str) -> str:
+    """Перевести текст замечания на русский ДЛЯ ПОКАЗА (быстрый Google, кэш).
+    Внутренняя логика (ревизии/судья) использует оригинальный английский."""
+    t = (text or "").strip()
+    if not t:
+        return text
+    if t in _findings_ru_cache:
+        return _findings_ru_cache[t]
+    try:
+        ru = _google_translate(t, "ru")
+    except Exception:  # noqa: BLE001 — нет сети/сбой → оставляем как есть
+        ru = text
+    _findings_ru_cache[t] = ru
+    return ru
+
+
+def _report_ru(rep_dict: dict) -> dict:
+    """Перевести человекочитаемые поля замечаний (problem/judge_reason) на русский
+    для UI. quote/locator/block/responsible_node не трогаем (нужны как есть)."""
+    for f in rep_dict.get("findings") or []:
+        if f.get("problem"):
+            f["problem"] = _to_ru_display(f["problem"])
+        if f.get("judge_reason"):
+            f["judge_reason"] = _to_ru_display(f["judge_reason"])
+    return rep_dict
+
+
 def _serialize(values: dict) -> dict:
     """State → JSON-safe dict. findings получают актуальный статус/коммент из decisions."""
     decisions = values.get("finding_decisions") or {}
@@ -199,7 +232,8 @@ def _serialize(values: dict) -> dict:
         if key == "chapters":
             out[key] = [c.model_dump() for c in val]
         elif key == "editor_reports":
-            out[key] = [apply_decisions(r, decisions).model_dump() for r in val]
+            out[key] = [_report_ru(apply_decisions(r, decisions).model_dump())
+                        for r in val]
         else:
             out[key] = val
     return out
@@ -291,7 +325,7 @@ class StartReq(BaseModel):
     genre: Optional[str] = None
     target_language: str = "English"
     chapters_per_batch: int = 3
-    translation_enabled: bool = False  # перевод временно на паузе
+    translation_enabled: bool = True  # Бот 8: перевод на все языки (Google)
     step_mode: bool = True
     chapter_model: Optional[str] = None  # модель для глав (Бот 5, не-адалт)
     default_words: int = 0               # цель слов/главу (0 → дефолт конфига)
@@ -1286,6 +1320,68 @@ def project_apply(thread_id: str, req: ProjectApplyReq):
     return _bg_op(run, _op)
 
 
+def _apply_project_target(thread_id: str, run, st: dict, target: str,
+                          idx: int, new: str) -> None:
+    """Записать новый контент в выбранный результат бота (для project_apply*)."""
+    if target in ("chapter_plan", "chapter_dialogue"):
+        chs = list(_state(thread_id).get("chapters") or [])
+        if not (0 <= idx < len(chs)):
+            return
+        if target == "chapter_plan":
+            chs[idx].plan = new
+        else:
+            chs[idx].dialogue = new
+        _patch(thread_id, run, {"chapters": chs})
+        run.events.put({"type": "edited", "keys": ["chapters"]})
+    elif target == "logline":
+        lst = list(st.get("loglines") or [])
+        sel = st.get("selected_logline")
+        lst = [new if x == sel else x for x in lst] if sel in lst else [new, *lst]
+        _patch(thread_id, run, {"loglines": lst, "selected_logline": new})
+        run.events.put({"type": "edited", "keys": ["loglines"]})
+    else:
+        _patch(thread_id, run, {target: new})
+        run.events.put({"type": "edited", "keys": [target]})
+
+
+@app.post("/api/runs/{thread_id}/project_apply_auto")
+def project_apply_auto(thread_id: str, req: ProjectChatReq):
+    """Ассистент САМ решает по итогу обсуждения, какой результат бота изменить,
+    и вносит правку. Не управляет пайплайном/порядком — только содержимое."""
+    from narrative import prompts  # noqa: PLC0415
+    from narrative.state import ProjectAutoEdit  # noqa: PLC0415
+    run = _get_run(thread_id)
+    _busy(run)
+    st = _state(thread_id)
+    convo = nodes.to_english("\n".join(
+        f"{'Нарративщик' if m.get('role') == 'user' else 'ИИ'}: "
+        f"{m.get('content', '')}"
+        for m in (req.messages or []) if m.get("role") in ("user", "assistant")
+    ))
+    system = (
+        "Ты — ассистент-сценарист 18+. По итогу обсуждения реши, какой ОДИН "
+        "результат бота нужно изменить (синопсис, персонажи, локации, логлайн, "
+        "план или текст конкретной главы), и выдай его ПОЛНЫЙ новый вариант. "
+        "Если по обсуждению менять нечего — changed=false, target=none. Меняй "
+        "ТОЛЬКО содержимое, не трогай порядок глав и этапы. new_content — на "
+        "английском, в том же формате, что был."
+        + prompts.NAMES_RULE + prompts.CONTENT_POLICY
+        + "\n\nКОНТЕКСТ ПРОЕКТА:\n" + _project_context(st)
+    )
+    user = f"Обсуждение:\n{convo}\n\nРеши, что изменить, и выдай новый текст."
+
+    def _op():
+        out = nodes._structural(st, None).structured(
+            system, user, ProjectAutoEdit, temperature=0.3)
+        if not out.changed or out.target == "none" or not out.new_content.strip():
+            run.events.put({"type": "status", "status": run.status})
+            return
+        _apply_project_target(thread_id, run, st, out.target,
+                              out.chapter_index, out.new_content)
+
+    return _bg_op(run, _op)
+
+
 @app.post("/api/runs/{thread_id}/chapter/{idx}/apply_chat")
 def apply_chat(thread_id: str, idx: int, req: ChatReq):
     """Применить обсуждённое в чате к главе целиком (или не трогать).
@@ -1490,43 +1586,10 @@ class TranslateReq(BaseModel):
 _GT_CODE = {"russian": "ru", "english": "en", "ru": "ru", "en": "en"}
 
 
-def _gt_chunks(text: str, limit: int = 4500) -> list[str]:
-    """Бьём текст на куски < limit символов по границам строк (URL/лимит запроса)."""
-    out: list[str] = []
-    buf = ""
-    for line in text.splitlines(keepends=True):
-        if len(buf) + len(line) > limit and buf:
-            out.append(buf)
-            buf = ""
-        # одна строка длиннее лимита — режем жёстко
-        while len(line) > limit:
-            out.append(line[:limit])
-            line = line[limit:]
-        buf += line
-    if buf:
-        out.append(buf)
-    return out or [text]
-
-
 def _google_translate(text: str, to_code: str) -> str:
-    """Быстрый перевод через бесплатный endpoint Google Translate (без ключа,
-    без ИИ). sl=auto — автоопределение исходного языка."""
-    import httpx  # noqa: PLC0415
-    parts: list[str] = []
-    with httpx.Client(timeout=12) as cli:
-        for chunk in _gt_chunks(text):
-            r = cli.get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={"client": "gtx", "sl": "auto", "tl": to_code,
-                        "dt": "t", "q": chunk},
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            r.raise_for_status()
-            data = r.json()
-            # data[0] = список сегментов [[translated, original, ...], ...]
-            seg = "".join(s[0] for s in (data[0] or []) if s and s[0])
-            parts.append(seg)
-    return "".join(parts)
+    """Быстрый перевод через Google Translate (общий модуль narrative.gtrans)."""
+    from narrative.gtrans import google_translate  # noqa: PLC0415
+    return google_translate(text, to_code)
 
 
 @app.post("/api/translate")
@@ -1600,29 +1663,72 @@ def export_project(thread_id: str, fmt: str = "txt"):
     """
     st = _state(thread_id)
     chapters = list(st.get("chapters") or [])
-    theme = st.get("theme") or ""
     md = fmt == "md"
 
+    from narrative import gtrans  # noqa: PLC0415
+    # ТОЛЬКО содержимое глав: оригинал (English) + все варианты перевода.
     parts: list[str] = []
-    title = "Визуальная новелла 18+"
-    parts.append(f"# {title}" if md else title.upper())
-    if theme:
-        parts.append(("> " if md else "Тема: ") + theme)
-    parts.append("")
-
     for ch in chapters:
         head = f"Глава {ch.index + 1}. {ch.title}"
         parts.append(f"\n## {head}" if md else f"\n\n=== {head} ===")
-        body = ch.dialogue or ch.plan or "(глава ещё не написана)"
-        parts.append(body)
-        if ch.translation:
-            parts.append(("\n### Перевод" if md else "\n--- Перевод ---"))
-            parts.append(ch.translation)
+        orig = (ch.dialogue or "").strip()
+        if orig:
+            lbl = "English (оригинал)"
+            parts.append(f"\n### {lbl}" if md else f"\n--- {lbl} ---")
+            parts.append(orig)
+        trs = getattr(ch, "translations", None) or {}
+        for code in gtrans.TARGET_CODES:
+            t = (trs.get(code) or "").strip()
+            if not t:
+                continue
+            lbl = gtrans.NAME_BY_CODE.get(code, code)
+            parts.append(f"\n### {lbl}" if md else f"\n--- {lbl} ---")
+            parts.append(t)
 
     text = "\n".join(parts).strip() + "\n"
     safe = "novella"
     fname = f"{safe}.{ 'md' if md else 'txt'}"
     return {"filename": fname, "text": text, "chapters": len(chapters)}
+
+
+@app.get("/api/runs/{thread_id}/export.docx")
+def export_project_docx(thread_id: str):
+    """Собрать новеллу в .docx (бинарь) — заголовки глав + текст + перевод."""
+    import io  # noqa: PLC0415
+    from docx import Document  # noqa: PLC0415
+    st = _state(thread_id)
+    chapters = list(st.get("chapters") or [])
+
+    from narrative import gtrans  # noqa: PLC0415
+    # ТОЛЬКО содержимое глав: оригинал (English) + все варианты перевода.
+    doc = Document()
+
+    def _add(label: str, body: str):
+        doc.add_heading(label, level=2)
+        for line in body.split("\n"):
+            doc.add_paragraph(line)
+
+    for ch in chapters:
+        orig = (ch.dialogue or "").strip()
+        trs = getattr(ch, "translations", None) or {}
+        if not orig and not trs:
+            continue
+        doc.add_heading(f"Глава {ch.index + 1}. {ch.title}", level=1)
+        if orig:
+            _add("English (оригинал)", orig)
+        for code in gtrans.TARGET_CODES:
+            t = (trs.get(code) or "").strip()
+            if t:
+                _add(gtrans.NAME_BY_CODE.get(code, code), t)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    headers = {"Content-Disposition": 'attachment; filename="novella.docx"'}
+    return StreamingResponse(
+        buf, headers=headers,
+        media_type="application/vnd.openxmlformats-officedocument."
+                   "wordprocessingml.document")
 
 
 # ---------- Claude по подписке (#4 расширение): статус / тумблер / токен ----------

@@ -43,7 +43,9 @@ class Chapter(BaseModel):
     target_words: Optional[int] = None  # цель по словам (оверрайд default_words)
     dialogue: Optional[str] = None  # текст главы от Бота 5
     adult_scene: Optional[str] = None  # адалт-вставка от Бота 6
-    translation: Optional[str] = None  # перевод от Бота 8
+    translation: Optional[str] = None  # (устар.) перевод одной главы
+    # Бот 8: переводы главы на все языки {code -> текст} (Google Translate)
+    translations: dict[str, str] = Field(default_factory=dict)
     # Статики/анимации для художника (из structured-вывода Ботов 5/6).
     statics: list[StaticShot] = Field(default_factory=list)
     anims: list[StaticShot] = Field(default_factory=list)
@@ -94,7 +96,7 @@ class ChapterPlan(BaseModel):
     title: str = Field(description="Название главы")
     plan: str = Field(
         description="Полный план главы одним блоком: локация, что происходит, "
-        "эмоциональная дуга, точка выбора, финал."
+        "эмоциональная дуга, финал. История линейная — без выборов игрока."
     )
     is_adult: bool = Field(
         default=True,
@@ -173,6 +175,23 @@ class ChatApplyOut(BaseModel):
     changed: bool = Field(description="True — внесены правки; False — главу не трогаем")
     note: str = Field(default="", description="Что изменено / почему не тронуто (1-2 строки)")
     script: str = Field(default="", description="Полный новый текст главы (если changed)")
+
+
+class ProjectAutoEdit(BaseModel):
+    """Ассистент проекта сам решает, ЧТО менять по итогу обсуждения."""
+    changed: bool = Field(description="True — внести правку; False — ничего не менять")
+    target: Literal["none", "synopsis", "characters", "locations", "logline",
+                    "chapter_plan", "chapter_dialogue"] = Field(
+        description="Какой результат бота меняем. none — если менять нечего.")
+    chapter_index: int = Field(
+        default=-1,
+        description="Номер главы С НУЛЯ для chapter_plan/chapter_dialogue; иначе -1")
+    new_content: str = Field(
+        default="",
+        description="Полный НОВЫЙ текст выбранного результата (на английском, "
+        "тот же формат, что был). Пусто, если changed=false.")
+    note: str = Field(default="",
+                      description="Кратко на русском, что изменено или почему нет")
 
 
 class JudgeOut(BaseModel):

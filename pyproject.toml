@@ -13,7 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["ruff", "mypy"]
-server = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+server = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "python-docx>=1.1"]
 
 [build-system]
 requires = ["hatchling"]

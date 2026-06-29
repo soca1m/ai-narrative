@@ -118,7 +118,7 @@ def translate(text: str, to_lang: str = "Russian",
         f"{to_lang}. Keep visual-novel formatting EXACTLY: speaker labels "
         "(NAME:) keep the name; frame-tag lines like '01-Office-2 — ...' keep "
         "the tag code unchanged and translate only the description after the "
-        "dash; keep the choice block. Output ONLY the translation, no notes.")
+        "dash. Output ONLY the translation, no notes.")
     return _structural(state).complete(system, text)
 
 
@@ -947,7 +947,7 @@ def sync_plan_from_dialogue(state: State, ch: Chapter, idx: int) -> str:
         f"Готовый текст главы {idx + 1} «{ch.title}»:\n{ch.dialogue or ''}\n\n"
         f"Текущий план главы:\n{ch.plan}\n\n"
         "Обнови план этой главы так, чтобы он ТОЧНО отражал написанный текст: "
-        "локации, что происходит, эмоциональная дуга, точки выбора, адалт-точка. "
+        "локации, что происходит, эмоциональная дуга, адалт-точка (без выборов игрока). "
         "Верни только новый план главы, без преамбул."
     )
     return _structural(state, "dialogue").complete(
@@ -1170,21 +1170,41 @@ def editor_node(state: State) -> dict:
 
 
 def translation_node(state: State) -> dict:
-    """Бот 8 — перевод всех готовых глав. Гейтится флагом translation_enabled."""
+    """Бот 8 — перевод всех глав на ВСЕ языки через Google Translate (быстро, без
+    ИИ). Кладёт в ch.translations {code -> текст}. Гейтится translation_enabled."""
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+    from . import gtrans  # noqa: PLC0415
     if not state.get("translation_enabled", True):
         return {"log": ["· Бот 8: перевод отключён (на паузе)"]}
-    lang = state.get("target_language") or "English"
     chapters = list(state["chapters"])
-    for i, ch in enumerate(chapters):
+
+    def _src(ch) -> str:
         text = ch.dialogue or ""
         if ch.adult_scene:
-            text += f"\n\n--- АДАЛТ ---\n{ch.adult_scene}"
-        ch.translation = _structural(state, "translation").complete(
-            _prompt(state, "translation", prompts.TRANSLATION),
-            f"Целевой язык: {lang}\n\nТекст:\n{text}",
-        )
-        chapters[i] = ch
-    return {"chapters": chapters, "log": [f"✓ Бот 8: перевод на {lang} готов"]}
+            text += f"\n\n--- ADULT ---\n{ch.adult_scene}"
+        return text
+
+    # сетка (глава, язык) → перевод, параллельно (Google быстрый, но ждёт сеть)
+    jobs = [(i, code) for i in range(len(chapters)) for code in gtrans.TARGET_CODES
+            if _src(chapters[i]).strip()]
+
+    def _do(job):
+        i, code = job
+        try:
+            return i, code, gtrans.google_translate(_src(chapters[i]),
+                                                    gtrans.TL_BY_CODE[code])
+        except Exception:  # noqa: BLE001 — сбой одного языка не валит остальные
+            return i, code, ""
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for i, code, txt in ex.map(_do, jobs):
+            if txt:
+                chapters[i].translations[code] = txt
+
+    n = len(gtrans.TARGET_CODES)
+    return {"chapters": chapters,
+            "log": [f"✓ Бот 8: перевод глав на {n} языков готов"]}
 
 
 # ---------- служебный узел: учёт попытки правки ----------

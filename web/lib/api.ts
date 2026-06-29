@@ -31,6 +31,7 @@ export type Chapter = {
   dialogue: string | null;
   adult_scene: string | null;
   translation: string | null;
+  translations?: Record<string, string>;
   adult_block_reason: string | null;
   adult_bridge_hint: string | null;
   target_words?: number | null;
@@ -265,6 +266,11 @@ export const projectApply = (
   id: string, target: ApplyTarget, messages: ChatMsg[], chapter_idx?: number,
 ): Promise<{ ok?: boolean; started?: boolean }> =>
   jpost(`/api/runs/${id}/project_apply`, { target, messages, chapter_idx });
+// ассистент сам решает, какой результат бота изменить
+export const projectApplyAuto = (
+  id: string, messages: ChatMsg[],
+): Promise<{ ok?: boolean; started?: boolean }> =>
+  jpost(`/api/runs/${id}/project_apply_auto`, { messages });
 export const chatWithEditor = (
   id: string,
   messages: ChatMsg[],
@@ -290,6 +296,18 @@ export const exportProject = (
   id: string, fmt: "txt" | "md" = "txt",
 ): Promise<{ filename: string; text: string; chapters: number }> =>
   jget(`/api/runs/${id}/export?fmt=${fmt}`);
+
+// скачать .docx (бинарь) — фетчим blob и триггерим загрузку в браузере
+export async function downloadDocx(id: string): Promise<void> {
+  const r = await fetch(`${API_BASE}/api/runs/${id}/export.docx`);
+  if (!r.ok) throw new Error(`docx export failed: ${r.status}`);
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "novella.docx";
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
 
 // #3: перевод произвольного текста (английский вывод → русский для чтения)
 export const translateText = (text: string, to: "ru" | "en" = "ru"): Promise<{ text: string }> =>

@@ -20,13 +20,13 @@ import {
   ClaudeStatus,
   NarrativeState,
   LimitInfo,
-  ApplyTarget,
   projectChat,
-  projectApply,
+  projectApplyAuto,
   chatWithEditor,
   applyChatToChapter,
   applyRevision,
   exportProject,
+  downloadDocx,
   restructure,
   addChapter,
   genChapterPlan,
@@ -290,7 +290,7 @@ export default function Page() {
   );
   const [genre, setGenre] = useState("");
   const lang = "English";  // генерация всегда на английском (поле языка убрано)
-  const [translation, setTranslation] = useState(false);
+  const [translation, setTranslation] = useState(true);
   const [stepMode, setStepMode] = useState(true);
 
   const [threadId, setThreadId] = useState<string | null>(null);
@@ -601,9 +601,10 @@ export default function Page() {
     && (st.chapters ?? []).every((c) => !!c.dialogue);
   const projectDone = status === "done";
 
-  async function onDownload(fmt: "txt" | "md") {
+  async function onDownload(fmt: "txt" | "md" | "docx") {
     if (!threadId) return;
     try {
+      if (fmt === "docx") { await downloadDocx(threadId); return; }
       const r = await exportProject(threadId, fmt);
       downloadText(r.filename, r.text);
     } catch {
@@ -637,7 +638,7 @@ export default function Page() {
         <div className="check">
           <input id="tr" type="checkbox" checked={translation}
             onChange={(e) => setTranslation(e.target.checked)} />
-          <label htmlFor="tr" className="inline">Перевод (Бот 8) — сейчас на паузе</label>
+          <label htmlFor="tr" className="inline">Перевод (Бот 8) — на все языки через Google (финальный шаг)</label>
         </div>
         <div className="check">
           <input id="step" type="checkbox" checked={stepMode}
@@ -859,8 +860,7 @@ export default function Page() {
 
         {threadId && (
           <div style={{ display: tab === "assistant" ? "block" : "none" }}>
-            <AssistantTab threadId={threadId} busy={busy} onRefresh={refresh}
-              chapters={st.chapters ?? []} />
+            <AssistantTab threadId={threadId} busy={busy} onRefresh={refresh} />
           </div>
         )}
 
@@ -883,7 +883,8 @@ export default function Page() {
                   редактором. Можно скачать готовый текст новеллы.
                 </div>
                 <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
-                  <button onClick={() => onDownload("txt")}><Download size={16} /> Скачать .txt</button>
+                  <button onClick={() => onDownload("docx")}><Download size={16} /> Скачать .docx</button>
+                  <button className="secondary" onClick={() => onDownload("txt")}><Download size={16} /> Скачать .txt</button>
                   <button className="secondary" onClick={() => onDownload("md")}>
                     <Download size={16} /> Скачать .md
                   </button>
@@ -1047,16 +1048,14 @@ export default function Page() {
 }
 
 
-// ---------- Ассистент: чат по всему проекту + применение правок ----------
-function AssistantTab({ threadId, busy, chapters, onRefresh }: {
-  threadId: string; busy?: boolean; chapters: Chapter[]; onRefresh: () => void;
+// ---------- Ассистент: чат по всему проекту + автоприменение правок ----------
+function AssistantTab({ threadId, busy, onRefresh }: {
+  threadId: string; busy?: boolean; onRefresh: () => void;
 }) {
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [applying, setApplying] = useState(false);
-  const [target, setTarget] = useState<ApplyTarget>("synopsis");
-  const [chIdx, setChIdx] = useState(0);
   const [note, setNote] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
@@ -1077,8 +1076,6 @@ function AssistantTab({ threadId, busy, chapters, onRefresh }: {
   }, [msgs, threadId, lsKey]);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs, sending]);
 
-  const needsChapter = target === "chapter_plan" || target === "chapter_dialogue";
-
   async function send() {
     const text = input.trim();
     if (!text || sending) return;
@@ -1097,9 +1094,8 @@ function AssistantTab({ threadId, busy, chapters, onRefresh }: {
     if (!msgs.length || applying) return;
     setApplying(true); setErr(null); setNote(null);
     try {
-      await projectApply(threadId, target, msgs, needsChapter ? chIdx : undefined);
-      const lbl = TARGET_LABELS[target] + (needsChapter ? ` (глава ${chIdx + 1})` : "");
-      setNote(`Применено к: ${lbl}. Загляни во вкладку «Конвейер».`);
+      await projectApplyAuto(threadId, msgs);
+      setNote("ИИ применил правку к нужному этапу. Загляни во вкладку «Конвейер».");
       onRefresh();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Не удалось применить");
@@ -1110,13 +1106,13 @@ function AssistantTab({ threadId, busy, chapters, onRefresh }: {
     <div className="asst">
       <div className="asst-head">
         <MessageSquare size={16} /> Ассистент проекта
-        <span className="asst-sub">обсуждай весь проект; правки применяются только к выбранному результату бота</span>
+        <span className="asst-sub">обсуждай весь проект; «Применить» — ИИ сам решит, какой этап изменить</span>
       </div>
       <div className="asst-thread">
         {!msgs.length && (
           <div className="asst-empty">
             Спроси что угодно по проекту: логлайн, синопсис, персонажи, локации, планы и тексты глав.
-            Обсуди правку — потом выбери, к чему её применить, и нажми «Применить».
+            Обсуди правку и нажми «Применить» — ИИ сам поймёт, какой результат изменить.
           </div>
         )}
         {msgs.map((m, i) => (
@@ -1128,28 +1124,10 @@ function AssistantTab({ threadId, busy, chapters, onRefresh }: {
       {err && <div className="asst-err">{err}</div>}
       {note && <div className="asst-note"><Check size={13} /> {note}</div>}
       <div className="asst-apply">
-        <span className="lbl">Применить к:</span>
-        <select value={target} disabled={busy || applying}
-          onChange={(e) => setTarget(e.target.value as ApplyTarget)}>
-          <option value="synopsis">Синопсис</option>
-          <option value="characters">Персонажи</option>
-          <option value="locations">Локации</option>
-          <option value="logline">Логлайн</option>
-          <option value="chapter_plan">План главы</option>
-          <option value="chapter_dialogue">Текст главы</option>
-        </select>
-        {needsChapter && (
-          <select value={chIdx} disabled={busy || applying}
-            onChange={(e) => setChIdx(+e.target.value)}>
-            {chapters.map((c) => (
-              <option key={c.index} value={c.index}>Глава {c.index + 1} · {c.title}</option>
-            ))}
-          </select>
-        )}
         <button className="small" disabled={busy || applying || !msgs.length}
-          title="ИИ перепишет выбранный результат по обсуждению (пайплайн и порядок не трогает)"
+          title="ИИ сам определит, какой результат бота изменить по обсуждению (пайплайн и порядок не трогает)"
           onClick={apply}>
-          {applying ? <><Loader2 size={14} className="spin" /> Применяю…</> : <><Check size={14} /> Применить</>}
+          {applying ? <><Loader2 size={14} className="spin" /> Применяю…</> : <><Check size={14} /> Применить изменения</>}
         </button>
       </div>
       <div className="asst-input">
@@ -1163,12 +1141,6 @@ function AssistantTab({ threadId, busy, chapters, onRefresh }: {
     </div>
   );
 }
-
-const TARGET_LABELS: Record<ApplyTarget, string> = {
-  synopsis: "Синопсис", characters: "Персонажи", locations: "Локации",
-  logline: "Логлайн", chapter_plan: "План главы", chapter_dialogue: "Текст главы",
-};
-
 
 // блок-плейсхолдер «ИИ пишет…»: скелет + спиннер, на месте будущего артефакта.
 // Появляется, пока этап генерится; превращается в обычный блок по готовности.
@@ -1381,7 +1353,7 @@ function Chapters(props: {
   writingIdx?: number | null; writingText?: string;
   chapters: Chapter[]; reports: EditorReport[];
   canDownload?: boolean;
-  onDownload?: (fmt: "txt" | "md") => void;
+  onDownload?: (fmt: "txt" | "md" | "docx") => void;
   onSaveAll: (chs: Chapter[]) => void;
   onReviseChapter: (i: number, fb: string) => Promise<void>;
   onReviseDialogue: (i: number, fb: string) => Promise<void>;
@@ -1500,8 +1472,8 @@ function Chapters(props: {
         Главы · структура → диалоги+адалт → редактор
         <span className="row" style={{ marginLeft: "auto", gap: 8 }}>
           {props.canDownload && props.onDownload && (
-            <button className="small ghost" disabled={props.busy} onClick={() => props.onDownload!("txt")}
-              title="Скачать собранный текст всех глав"><Download size={14} /> Скачать</button>
+            <button className="small ghost" disabled={props.busy} onClick={() => props.onDownload!("docx")}
+              title="Скачать новеллу в .docx"><Download size={14} /> Скачать .docx</button>
           )}
           {props.rollbackStage === "dialogue" && (
             <button className="small ghost" disabled={props.busy} onClick={props.onRollbackWriting}
@@ -1662,7 +1634,7 @@ function Chapters(props: {
                     )}
                     {r.findings.map((f) => (
                       <FindingRow key={f.id} f={f} active={activeFinding === f.id}
-                        disabled={props.busy}
+                        disabled={props.busy} readOnly={k !== rs.length - 1}
                         onPick={() => pick(f.id, i)} onDecide={props.onDecide} />
                     ))}
                   </div>
@@ -1762,9 +1734,10 @@ function Chapters(props: {
 }
 
 function FindingRow({
-  f, active, onPick, onDecide, disabled,
+  f, active, onPick, onDecide, disabled, readOnly,
 }: {
   f: Finding; active: boolean; onPick: () => void; disabled?: boolean;
+  readOnly?: boolean;
   onDecide: (fid: string, body: { status?: FindingStatus }) => Promise<void>;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
@@ -1785,20 +1758,22 @@ function FindingRow({
       {f.quote && (
         <div className="fquote" onClick={onPick} title="Показать в тексте">“{f.quote}”</div>
       )}
-      <div className="factions">
-        {rejected ? (
-          <button className="xs ghost" disabled={!!busy || disabled}
-            onClick={() => act("open", "open")}>
-            {busy === "open" ? "…" : <><Undo2 size={13} /> Вернуть в правки</>}
-          </button>
-        ) : (
-          <button className="xs no" disabled={!!busy || disabled}
-            title="ИИ не будет это менять при перепроверке"
-            onClick={() => act("rej", "rejected")}>
-            {busy === "rej" ? "…" : <><X size={13} /> Не менять это</>}
-          </button>
-        )}
-      </div>
+      {!readOnly && (
+        <div className="factions">
+          {rejected ? (
+            <button className="xs ghost" disabled={!!busy || disabled}
+              onClick={() => act("open", "open")}>
+              {busy === "open" ? "…" : <><Undo2 size={13} /> Вернуть в правки</>}
+            </button>
+          ) : (
+            <button className="xs no" disabled={!!busy || disabled}
+              title="ИИ не будет это менять при перепроверке"
+              onClick={() => act("rej", "rejected")}>
+              {busy === "rej" ? "…" : <><X size={13} /> Не менять это</>}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
