@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import time
+
 import httpx
 
 # (code — как просил нарративщик, отображаемое имя, tl-код для Google Translate).
@@ -65,20 +67,39 @@ def _chunks(text: str, limit: int = 4500) -> list[str]:
 
 
 def google_translate(text: str, tl: str) -> str:
-    """Перевести text на язык tl через endpoint Google Translate (sl=auto)."""
+    """Перевести text на язык tl через endpoint Google Translate (sl=auto).
+
+    Ретрай с бэкоффом на 429/5xx: при массовом переводе (все главы × все языки)
+    Google троттлит, и без ретрая поздние главы молча терялись бы (пустой перевод).
+    """
     if not (text or "").strip():
         return text
     parts: list[str] = []
-    with httpx.Client(timeout=15) as cli:
+    with httpx.Client(timeout=20) as cli:
         for chunk in _chunks(text):
-            r = cli.get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={"client": "gtx", "sl": "auto", "tl": tl,
-                        "dt": "t", "q": chunk},
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            r.raise_for_status()
-            data = r.json()
-            seg = "".join(s[0] for s in (data[0] or []) if s and s[0])
+            seg = ""
+            for attempt in range(5):
+                try:
+                    r = cli.get(
+                        "https://translate.googleapis.com/translate_a/single",
+                        params={"client": "gtx", "sl": "auto", "tl": tl,
+                                "dt": "t", "q": chunk},
+                        headers={"User-Agent": "Mozilla/5.0"},
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                    seg = "".join(s[0] for s in (data[0] or []) if s and s[0])
+                    break
+                except httpx.HTTPStatusError as exc:
+                    code = exc.response.status_code
+                    if code in (429, 500, 502, 503) and attempt < 4:
+                        time.sleep(min(1.5 ** attempt, 8.0))  # backoff и повтор
+                        continue
+                    raise
+                except (httpx.TransportError, httpx.TimeoutException):
+                    if attempt < 4:
+                        time.sleep(min(1.5 ** attempt, 8.0))
+                        continue
+                    raise
             parts.append(seg)
     return "".join(parts)

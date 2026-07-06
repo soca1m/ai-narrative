@@ -1666,24 +1666,26 @@ def export_project(thread_id: str, fmt: str = "txt"):
     md = fmt == "md"
 
     from narrative import gtrans  # noqa: PLC0415
-    # ТОЛЬКО содержимое глав: оригинал (English) + все варианты перевода.
+    # Группировка ПО ЯЗЫКАМ: сначала ВСЕ главы на одном языке, потом на следующем.
     parts: list[str] = []
-    for ch in chapters:
-        head = f"Глава {ch.index + 1}. {ch.title}"
-        parts.append(f"\n## {head}" if md else f"\n\n=== {head} ===")
-        orig = (ch.dialogue or "").strip()
-        if orig:
-            lbl = "English (оригинал)"
-            parts.append(f"\n### {lbl}" if md else f"\n--- {lbl} ---")
-            parts.append(orig)
-        trs = getattr(ch, "translations", None) or {}
-        for code in gtrans.TARGET_CODES:
-            t = (trs.get(code) or "").strip()
-            if not t:
+
+    def _lang_block(lang_label: str, get_text) -> None:
+        bodies = [(ch, (get_text(ch) or "").strip()) for ch in chapters]
+        if not any(b for _, b in bodies):
+            return
+        parts.append(f"\n# {lang_label}" if md else f"\n\n########## {lang_label} ##########")
+        for ch, body in bodies:
+            if not body:
                 continue
-            lbl = gtrans.NAME_BY_CODE.get(code, code)
-            parts.append(f"\n### {lbl}" if md else f"\n--- {lbl} ---")
-            parts.append(t)
+            head = f"Глава {ch.index + 1}. {ch.title}"
+            parts.append(f"\n## {head}" if md else f"\n\n=== {head} ===")
+            parts.append(body)
+
+    # оригинал (English), затем каждый целевой язык
+    _lang_block("English (оригинал)", lambda ch: ch.dialogue)
+    for code in gtrans.TARGET_CODES:
+        _lang_block(gtrans.NAME_BY_CODE.get(code, code),
+                    lambda ch, c=code: (getattr(ch, "translations", None) or {}).get(c))
 
     text = "\n".join(parts).strip() + "\n"
     safe = "novella"
@@ -1700,26 +1702,25 @@ def export_project_docx(thread_id: str):
     chapters = list(st.get("chapters") or [])
 
     from narrative import gtrans  # noqa: PLC0415
-    # ТОЛЬКО содержимое глав: оригинал (English) + все варианты перевода.
+    # Группировка ПО ЯЗЫКАМ: заголовок языка (level 1), под ним все главы (level 2).
     doc = Document()
 
-    def _add(label: str, body: str):
-        doc.add_heading(label, level=2)
-        for line in body.split("\n"):
-            doc.add_paragraph(line)
+    def _lang_section(lang_label: str, get_text) -> None:
+        bodies = [(ch, (get_text(ch) or "").strip()) for ch in chapters]
+        if not any(b for _, b in bodies):
+            return
+        doc.add_heading(lang_label, level=1)
+        for ch, body in bodies:
+            if not body:
+                continue
+            doc.add_heading(f"Глава {ch.index + 1}. {ch.title}", level=2)
+            for line in body.split("\n"):
+                doc.add_paragraph(line)
 
-    for ch in chapters:
-        orig = (ch.dialogue or "").strip()
-        trs = getattr(ch, "translations", None) or {}
-        if not orig and not trs:
-            continue
-        doc.add_heading(f"Глава {ch.index + 1}. {ch.title}", level=1)
-        if orig:
-            _add("English (оригинал)", orig)
-        for code in gtrans.TARGET_CODES:
-            t = (trs.get(code) or "").strip()
-            if t:
-                _add(gtrans.NAME_BY_CODE.get(code, code), t)
+    _lang_section("English (оригинал)", lambda ch: ch.dialogue)
+    for code in gtrans.TARGET_CODES:
+        _lang_section(gtrans.NAME_BY_CODE.get(code, code),
+                      lambda ch, c=code: (getattr(ch, "translations", None) or {}).get(c))
 
     buf = io.BytesIO()
     doc.save(buf)

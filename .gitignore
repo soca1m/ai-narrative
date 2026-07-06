@@ -43,3 +43,8 @@ skills-lock.json
 
 # тестовый артефакт генерации главы
 test_chapter.txt
+
+# экспортированные новеллы
+novella.txt
+novella.*
+*.docx

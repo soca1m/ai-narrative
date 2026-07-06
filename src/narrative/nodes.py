@@ -1197,14 +1197,28 @@ def translation_node(state: State) -> dict:
         except Exception:  # noqa: BLE001 — сбой одного языка не валит остальные
             return i, code, ""
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    # копим переводы по главам, затем ПЕРЕСОБИРАЕМ каждую главу (model_copy) —
+    # in-place мутация dict на объектах из чекпоинта не всегда персистится.
+    by_ch: dict[int, dict[str, str]] = {i: {} for i in range(len(chapters))}
+    # 4 воркера (не 8): меньше троттлинга Google → все главы доходят
+    with ThreadPoolExecutor(max_workers=4) as ex:
         for i, code, txt in ex.map(_do, jobs):
             if txt:
-                chapters[i].translations[code] = txt
+                by_ch[i][code] = txt
+
+    new_chapters = []
+    done = 0
+    for i, ch in enumerate(chapters):
+        if by_ch.get(i):
+            merged = {**(ch.translations or {}), **by_ch[i]}
+            new_chapters.append(ch.model_copy(update={"translations": merged}))
+            done += 1
+        else:
+            new_chapters.append(ch)
 
     n = len(gtrans.TARGET_CODES)
-    return {"chapters": chapters,
-            "log": [f"✓ Бот 8: перевод глав на {n} языков готов"]}
+    return {"chapters": new_chapters,
+            "log": [f"✓ Бот 8: перевод {done} глав на {n} языков готов"]}
 
 
 # ---------- служебный узел: учёт попытки правки ----------
