@@ -1986,7 +1986,10 @@ function ClaudeSubPanel() {
       )}
 
       <div className="check" style={{ margin: "8px 0" }}>
-        <input id="suball" type="checkbox" disabled={!s?.authorized || busy}
+        {/* СНЯТЬ галочку можно всегда (даже без авторизации) — чтобы уйти на
+            OpenRouter. Блокируем только ВКЛючение без авторизации. */}
+        <input id="suball" type="checkbox"
+          disabled={busy || (!s?.authorized && !s?.enabled)}
           checked={!!s?.enabled} onChange={(e) => toggle(e.target.checked)} />
         <label htmlFor="suball" className="inline">Все боты через подписку (кроме адалта)</label>
       </div>
