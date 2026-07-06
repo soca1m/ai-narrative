@@ -12,7 +12,7 @@ from functools import lru_cache
 
 from . import live, prompts
 from .config import (CHAPTER_MAX_PASSES, CHAPTER_WORDS_DEFAULT, adult_provider,
-                     editor_provider, structural_provider)
+                     editor_provider, structural_provider, translator_provider)
 from .llm import LLM, LLMLimitError
 from .routing import retry_key
 from .state import (
@@ -107,10 +107,19 @@ def _has_cyrillic(text: str | None) -> bool:
     return bool(_CYRILLIC.search(text or ""))
 
 
+@lru_cache(maxsize=1)
+def _translator() -> LLM:
+    """Дешёвый переводчик-фолбэк (haiku, OpenRouter) — когда Google недоступен."""
+    return LLM(translator_provider())
+
+
 def translate(text: str, to_lang: str = "Russian",
-              state: State | None = None) -> str:
-    """Перевод текста на to_lang через LLM. Сохраняет формат ВН (имена,
-    теги кадров NN-Loc-N, блок выбора) — переводит только прозу/реплики."""
+              state: State | None = None) -> str:  # noqa: ARG001
+    """Перевод текста на to_lang через LLM-ФОЛБЭК (haiku). Сохраняет формат ВН
+    (имена, теги кадров NN-Loc-N, блок выбора) — переводит только прозу/реплики.
+
+    Используется как фолбэк, когда бесплатный Google Translate недоступен/троттлит.
+    """
     if not (text or "").strip():
         return text
     system = (
@@ -119,7 +128,7 @@ def translate(text: str, to_lang: str = "Russian",
         "(NAME:) keep the name; frame-tag lines like '01-Office-2 — ...' keep "
         "the tag code unchanged and translate only the description after the "
         "dash. Output ONLY the translation, no notes.")
-    return _structural(state).complete(system, text)
+    return _translator().complete(system, text)
 
 
 def to_english(text: str, state: State | None = None) -> str:
@@ -1189,12 +1198,25 @@ def translation_node(state: State) -> dict:
     jobs = [(i, code) for i in range(len(chapters)) for code in gtrans.TARGET_CODES
             if _src(chapters[i]).strip()]
 
+    # человекочитаемый язык для LLM-фолбэка по коду
+    lang_by_code = {c: n for c, n, _ in gtrans.LANGUAGES}
+
     def _do(job):
         i, code = job
+        src = _src(chapters[i])
+        # 1) бесплатный Google с ретраями на троттлинг
         try:
-            return i, code, gtrans.google_translate(_src(chapters[i]),
-                                                    gtrans.TL_BY_CODE[code])
-        except Exception:  # noqa: BLE001 — сбой одного языка не валит остальные
+            out = gtrans.google_translate(src, gtrans.TL_BY_CODE[code],
+                                          tries=5, timeout=20)
+            if out.strip():
+                return i, code, out
+        except Exception:  # noqa: BLE001 — Google недоступен/блок → фолбэк
+            pass
+        # 2) фолбэк на haiku (дёшево, надёжно, без внешних лимитов)
+        try:
+            lang = lang_by_code.get(code, code)
+            return i, code, translate(src, lang)
+        except Exception:  # noqa: BLE001 — не валим остальные языки/главы
             return i, code, ""
 
     # копим переводы по главам, затем ПЕРЕСОБИРАЕМ каждую главу (model_copy) —

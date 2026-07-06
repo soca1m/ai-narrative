@@ -66,19 +66,23 @@ def _chunks(text: str, limit: int = 4500) -> list[str]:
     return out or [text]
 
 
-def google_translate(text: str, tl: str) -> str:
+def google_translate(text: str, tl: str, *, tries: int = 1,
+                     timeout: float = 8.0) -> str:
     """Перевести text на язык tl через endpoint Google Translate (sl=auto).
 
-    Ретрай с бэкоффом на 429/5xx: при массовом переводе (все главы × все языки)
-    Google троттлит, и без ретрая поздние главы молча терялись бы (пустой перевод).
+    tries=1 (дефолт) — БЫСТРО, без ретраев: для интерактивной кнопки перевода.
+    Если Google недоступен/блокирует (напр. datacenter-IP удалённого сервера) —
+    сразу бросаем исключение, чтобы вызывающий ушёл в фолбэк (LLM), а не висел.
+    tries>1 — с бэкоффом на 429/5xx: для БАТЧ-перевода всех глав (Google троттлит).
     """
     if not (text or "").strip():
         return text
+    tries = max(1, tries)
     parts: list[str] = []
-    with httpx.Client(timeout=20) as cli:
+    with httpx.Client(timeout=timeout) as cli:
         for chunk in _chunks(text):
             seg = ""
-            for attempt in range(5):
+            for attempt in range(tries):
                 try:
                     r = cli.get(
                         "https://translate.googleapis.com/translate_a/single",
@@ -92,13 +96,13 @@ def google_translate(text: str, tl: str) -> str:
                     break
                 except httpx.HTTPStatusError as exc:
                     code = exc.response.status_code
-                    if code in (429, 500, 502, 503) and attempt < 4:
-                        time.sleep(min(1.5 ** attempt, 8.0))  # backoff и повтор
+                    if code in (429, 500, 502, 503) and attempt < tries - 1:
+                        time.sleep(min(1.5 ** attempt, 6.0))  # backoff и повтор
                         continue
                     raise
                 except (httpx.TransportError, httpx.TimeoutException):
-                    if attempt < 4:
-                        time.sleep(min(1.5 ** attempt, 8.0))
+                    if attempt < tries - 1:
+                        time.sleep(min(1.5 ** attempt, 6.0))
                         continue
                     raise
             parts.append(seg)

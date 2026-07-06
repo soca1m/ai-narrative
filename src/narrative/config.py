@@ -46,6 +46,19 @@ def editor_provider() -> ProviderConfig:
     )
 
 
+# Переводчик-фолбэк (когда free Google Translate недоступен/троттлит).
+# Haiku через OpenRouter: дёшево ($1/$5), надёжно, без внешних лимитов.
+# НЕ подписка — перевод должен быть быстрым/дешёвым, sonnet тут не нужен.
+def translator_provider() -> ProviderConfig:
+    return ProviderConfig(
+        base_url=_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        api_key=_env("OPENROUTER_API_KEY"),
+        model=_env("TRANSLATOR_MODEL", "anthropic/claude-haiku-4.5"),
+        temperature=0.2,
+        max_tokens=int(_env("TRANSLATOR_MAX_TOKENS", "0")),  # 0 = без лимита
+    )
+
+
 # Адалт-сцены (Бот 6) → отдельная модель без цензуры.
 # Дефолт — Magnum v4 72B на OpenRouter (подтверждён живым).
 # Можно подменить на локальный сервер: ADULT_BASE_URL=http://localhost:8000/v1

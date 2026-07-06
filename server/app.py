@@ -1601,17 +1601,21 @@ def translate_ep(req: TranslateReq):
     if not (req.text or "").strip():
         return {"text": req.text, "via": "noop"}
     code = _GT_CODE.get(req.to.lower(), req.to.lower()[:2])
+    # 1) быстрый Google (без ретраев — на заблокированном IP не виснем)
     try:
         return {"text": _google_translate(req.text, code), "via": "google"}
-    except Exception:  # noqa: BLE001 — любой сбой сети/парсинга → фолбэк на ИИ
+    except Exception:  # noqa: BLE001 — сеть/блокировка/парсинг → фолбэк на ИИ
         pass
+    # 2) фолбэк на LLM
     lang = {"ru": "Russian", "en": "English"}.get(req.to.lower(), req.to)
     try:
         return {"text": nodes.translate(req.text, lang), "via": "llm"}
     except LLMLimitError as exc:
         raise HTTPException(429, _limit_detail(exc))
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"перевод недоступен: {str(exc)[:160]}")
+    except Exception:  # noqa: BLE001
+        # 3) оба недоступны (напр. удалённый сервер без доступа к Google и без
+        # LLM-креды) → отдаём ОРИГИНАЛ с 200, чтобы UI не падал с ошибкой/пустотой
+        return {"text": req.text, "via": "none"}
 
 
 # ---------- dev: оверрайд системных промптов по шагам (#4) ----------
