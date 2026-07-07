@@ -38,7 +38,12 @@ def _critical_count(report) -> int:
 def _after_editor(state: State) -> str:
     """Условное ребро после редактора: правка / следующая глава / перевод."""
     idx = state["chapter_idx"]
-    reports = state["editor_reports"]
+    # ТОЛЬКО отчёты ЭТОЙ главы: в общий список могли вклиниться отчёты других
+    # глав (ручной apply_revision во время паузы) — сравнение прогресса по
+    # хвосту всего списка сравнивало бы чужие главы.
+    reports = [r for r in state["editor_reports"] if r.chapter_index == idx]
+    if not reports:
+        return "advance"
     decisions = state.get("finding_decisions") or {}
     last = apply_decisions(reports[-1], decisions)
     target, _ = pick_revision_target(last, _is_adult_chapter(state))

@@ -302,6 +302,7 @@ export default function Page() {
   const [st, setSt] = useState<NarrativeState>({});
   const [gen, setGen] = useState<{ stage: string; idx: number | null; text: string } | null>(null);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollGenRef = useRef(0);  // поколение цикла поллинга (гонка при смене работ)
 
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [dirty, setDirty] = useState<Set<string>>(new Set());
@@ -366,9 +367,16 @@ export default function Page() {
 
   function poll(id: string) {
     if (pollRef.current) clearTimeout(pollRef.current);
+    // поколение поллинга: тик, начатый ДО переключения работы/перезапуска poll,
+    // после await не должен ни применять чужое состояние, ни перепланировать
+    // себя (иначе два вечных цикла и мигание между работами)
+    const gen0 = ++pollGenRef.current;
+    let fails = 0;
     const tick = async () => {
       try {
         const r = await getState(id);
+        if (gen0 !== pollGenRef.current) return;  // устаревший цикл — умираем
+        fails = 0;
         setStatus(r.status);
         setNext(r.next);
         setErr(r.error || null);
@@ -381,6 +389,9 @@ export default function Page() {
           // во время генерации поллим часто → видно как ИИ пишет текст
           pollRef.current = setTimeout(tick, r.gen ? 400 : 1200);
       } catch {
+        if (gen0 !== pollGenRef.current) return;
+        fails += 1;
+        if (fails >= 3) setErr("Нет связи с сервером — продолжаю попытки…");
         pollRef.current = setTimeout(tick, 2000);
       }
     };
@@ -977,6 +988,7 @@ export default function Page() {
             )}
 
             <Chapters
+              key={threadId}  /* ремоунт при смене работы: локальные правки не утекают в другой проект */
               onAddChapter={onAddChapter}
               onGenChapterPlan={onGenChapterPlan}
               onDeleteChapter={onDeleteChapter}
@@ -1104,8 +1116,12 @@ function AssistantTab({ threadId, busy, onRefresh }: {
     if (!msgs.length || applying) return;
     setApplying(true); setErr(null); setNote(null);
     try {
-      await projectApplyAuto(threadId, msgs);
-      setNote("ИИ применил правку к нужному этапу. Загляни во вкладку «Конвейер».");
+      const r = await projectApplyAuto(threadId, msgs);
+      if (r.started === false && r.ok !== true) {
+        setNote("Правка не запустилась — попробуй ещё раз чуть позже.");
+      } else {
+        setNote("ИИ применяет правку к нужному этапу — смотри вкладку «Конвейер».");
+      }
       onRefresh();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Не удалось применить");
@@ -1398,13 +1414,24 @@ function Chapters(props: {
   const [dragIdx, setDragIdx] = useState<number | null>(null);    // drag-drop
   const [overIdx, setOverIdx] = useState<number | null>(null);
   const dirty = Object.keys(edits).length > 0;
-  // drag-drop: переставить главу src на место dst (в порядке повествования)
+  // структурные операции переиндексируют главы → несохранённые правки, ключованные
+  // индексом, попали бы в ЧУЖУЮ главу. Поэтому: сначала автосохраняем правки.
+  async function commitThen(fn: () => void | Promise<void>) {
+    if (dirty) await commit();
+    await fn();
+  }
+  // drag-drop: переставить главу src на место dst (в порядке повествования).
+  // ВАЖНО: позицию dst берём ПОСЛЕ удаления src — иначе при перетаскивании вниз
+  // элемент вставал на слот дальше цели (аргументы splice считались до мутации).
   function reorderTo(src: number, dst: number) {
     if (src === dst) return;
     const asc = [...props.chapters].sort((a, b) => a.index - b.index).map((c) => c.index);
     const from = asc.indexOf(src);
-    asc.splice(asc.indexOf(dst), 0, asc.splice(from, 1)[0]);
-    props.onReorderChapters(asc);
+    let to = asc.indexOf(dst);
+    const [moved] = asc.splice(from, 1);
+    if (from < to) to -= 1;   // удаление сдвинуло цель влево
+    asc.splice(to, 0, moved); // встаём ровно на слот цели
+    commitThen(() => props.onReorderChapters(asc));
   }
   const tkey = (i: number, f: string) => `${i}-${f}`;
   const tallCls = (i: number, f: string) => (tall[tkey(i, f)] ? "tall" : "");
@@ -1560,17 +1587,17 @@ function Chapters(props: {
                 Низ = первая глава по сюжету; «Выше»/«Ниже» = движение на экране. */}
             <div className="chap-manage">
               <button className="xs ghost" disabled={props.busy || isTop}
-                onClick={() => props.onMoveChapter(i, "down")}
+                onClick={() => commitThen(() => props.onMoveChapter(i, "down"))}
                 title="Поднять главу выше на экране (ближе к финалу истории)">
                 <ArrowUp size={12} /> Выше
               </button>
               <button className="xs ghost" disabled={props.busy || isBottom}
-                onClick={() => props.onMoveChapter(i, "up")}
+                onClick={() => commitThen(() => props.onMoveChapter(i, "up"))}
                 title="Опустить главу ниже на экране (ближе к началу истории)">
                 <ArrowDown size={12} /> Ниже
               </button>
               <button className="xs ghost danger" disabled={props.busy || props.chapters.length <= 1}
-                onClick={() => props.onDeleteChapter(i)}
+                onClick={() => commitThen(() => props.onDeleteChapter(i))}
                 title="Удалить эту главу (остальные переиндексируются)">
                 <Trash2 size={12} /> Удалить
               </button>

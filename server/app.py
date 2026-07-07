@@ -144,11 +144,6 @@ def _bg_op(run: Run, fn, stage: str | None = None,
     (paused/done), ошибку кладём в run.error, прогресс в чекпоинте цел."""
     from narrative import live  # noqa: PLC0415
     prev = run.status if run.status in ("paused", "done") else "paused"
-    # СИНХРОННО ставим running ДО старта потока — иначе немедленный poll фронта
-    # ловит ещё «paused» (гонка) и перестаёт поллить → правка видна лишь после F5.
-    run.cancel = False
-    run.status = "running"
-    run.error = ""
 
     def _worker():
         if stage:
@@ -183,8 +178,19 @@ def _bg_op(run: Run, fn, stage: str | None = None,
             live.clear()
             run.gen = None
 
-    run.worker = threading.Thread(target=_worker, daemon=True)
-    run.worker.start()
+    # старт под _LOCK: повторная проверка занятости закрывает TOCTOU-гонку
+    # (двойной клик → два одновременных LLM-воркера → потерянные записи).
+    # Статус running ставим СИНХРОННО здесь же (после проверки!) — иначе
+    # немедленный poll фронта ловит «paused» и перестаёт поллить (правки
+    # были видны только после F5).
+    with _LOCK:
+        if run.worker and run.worker.is_alive():
+            raise HTTPException(409, "run is busy")
+        run.cancel = False
+        run.status = "running"
+        run.error = ""
+        run.worker = threading.Thread(target=_worker, daemon=True)
+        run.worker.start()
     return {"ok": True, "started": True}
 
 
@@ -195,20 +201,32 @@ def _state(thread_id: str) -> dict:
 
 # кэш перевода замечаний редактора EN→RU (для показа; правки в коде остаются EN)
 _findings_ru_cache: dict[str, str] = {}
+# circuit breaker: Google недоступен (datacenter-IP блок и т.п.) → не дёргаем его
+# на каждый poll /state, иначе первый запрос после рестарта висит минутами.
+_gt_down_until: float = 0.0
 
 
 def _to_ru_display(text: str) -> str:
     """Перевести текст замечания на русский ДЛЯ ПОКАЗА (быстрый Google, кэш).
-    Внутренняя логика (ревизии/судья) использует оригинальный английский."""
+    Внутренняя логика (ревизии/судья) использует оригинальный английский.
+
+    /state поллится каждые ~1с — здесь НЕЛЬЗЯ висеть: таймаут короткий (3с),
+    при сбое Google отключается на 5 минут (показываем английский как есть)."""
+    global _gt_down_until  # noqa: PLW0603
+    import time as _time  # noqa: PLC0415
     t = (text or "").strip()
     if not t:
         return text
     if t in _findings_ru_cache:
         return _findings_ru_cache[t]
+    if _time.time() < _gt_down_until:
+        return text  # Google лежит — не кэшируем, попробуем после паузы
     try:
-        ru = _google_translate(t, "ru")
-    except Exception:  # noqa: BLE001 — нет сети/сбой → оставляем как есть
-        ru = text
+        from narrative.gtrans import google_translate  # noqa: PLC0415
+        ru = google_translate(t, "ru", timeout=3.0)
+    except Exception:  # noqa: BLE001 — нет сети/сбой → пауза 5 минут
+        _gt_down_until = _time.time() + 300
+        return text
     _findings_ru_cache[t] = ru
     return ru
 
@@ -453,9 +471,12 @@ def resume_run(thread_id: str):
     run = _get_run(thread_id)
     _busy(run)
     run.limit = None  # снимаем баннер лимита при ресюме
-    run.worker = threading.Thread(
-        target=_run_worker, args=(run, None, None), daemon=True)
-    run.worker.start()
+    with _LOCK:  # TOCTOU: двойной resume → два воркера на один граф
+        if run.worker and run.worker.is_alive():
+            raise HTTPException(409, "run is busy")
+        run.worker = threading.Thread(
+            target=_run_worker, args=(run, None, None), daemon=True)
+        run.worker.start()
     return {"ok": True}
 
 
@@ -467,7 +488,7 @@ def stop_run(thread_id: str):
     run = _get_run(thread_id)
     if run.worker and run.worker.is_alive():
         run.cancel = True
-    else:
+    elif run.status == "running":  # завис без воркера — снимаем; done/error не трогаем
         run.status = "paused"
         run.events.put({"type": "status", "status": "paused"})
     return {"ok": True, "stopping": True}
@@ -777,6 +798,19 @@ def add_chapter(thread_id: str, req: AddChapterReq):
     run = _get_run(thread_id)
     _busy(run)
 
+    def _insert_patch(st: dict, chapters: list, pos: int) -> dict:
+        """Патч вставки: главы + сдвиг курсора, если вставили ДО него."""
+        patch: dict[str, Any] = {"chapters": chapters,
+                                 "revision_target": None,
+                                 "revision_feedback": None}
+        rc = _remap_retry(st, lambda n: n + 1 if n >= pos else n)
+        if rc is not None:
+            patch["retry_count"] = rc
+        cur = st.get("chapter_idx", 0)
+        if pos <= cur:
+            patch["chapter_idx"] = cur + 1
+        return patch
+
     if not req.generate:
         # пустой шаблон — синхронно, без LLM
         st = _state(thread_id)
@@ -787,7 +821,7 @@ def add_chapter(thread_id: str, req: AddChapterReq):
         chapters.insert(after + 1, new_ch)
         for i, ch in enumerate(chapters):
             ch.index = i
-        _patch(thread_id, run, {"chapters": chapters})
+        _patch(thread_id, run, _insert_patch(st, chapters, after + 1))
         run.structure_dirty = True
         run.events.put({"type": "edited", "keys": ["chapters"]})
         return {"ok": True, "chapters": len(chapters), "new_index": after + 1}
@@ -803,7 +837,7 @@ def add_chapter(thread_id: str, req: AddChapterReq):
         chapters.insert(after + 1, new_ch)
         for i, ch in enumerate(chapters):
             ch.index = i
-        _patch(thread_id, run, {"chapters": chapters})
+        _patch(thread_id, run, _insert_patch(st, chapters, after + 1))
         run.structure_dirty = True
         run.events.put({"type": "edited", "keys": ["chapters"]})
 
@@ -815,12 +849,15 @@ def gen_chapter_plan(thread_id: str, idx: int):
     """Сгенерировать ИИ план для (обычно пустой) главы idx — видит все главы."""
     run = _get_run(thread_id)
     _busy(run)
+    # валидация ДО старта потока — иначе клиент получал «ok» и лишь потом ошибку
+    if idx < 0 or idx >= len(_state(thread_id).get("chapters") or []):
+        raise HTTPException(400, "bad chapter index")
 
     def _op():
         st = _state(thread_id)
         chapters = list(st.get("chapters") or [])
-        if idx < 0 or idx >= len(chapters):
-            raise HTTPException(400, "bad chapter index")
+        if idx >= len(chapters):  # главу успели удалить — тихий no-op
+            return
         chapters[idx].plan = nodes.gen_chapter_plan(st, idx)
         _patch(thread_id, run, {"chapters": chapters})
         run.events.put({"type": "edited", "keys": ["chapters"]})
@@ -854,6 +891,26 @@ def manual_structure(thread_id: str):
     return {"ok": True}
 
 
+def _remap_retry(st: dict, remap) -> dict | None:
+    """Пересчитать ключи retry_count ("node:chapterIdx") при переиндексации глав.
+    remap(old_idx) -> new_idx | None (None = глава удалена, счётчик отбрасываем)."""
+    rc = st.get("retry_count") or {}
+    if not rc:
+        return None
+    out: dict[str, int] = {}
+    for key, cnt in rc.items():
+        node, _, sidx = key.rpartition(":")
+        try:
+            old = int(sidx)
+        except ValueError:
+            out[key] = cnt
+            continue
+        new = remap(old)
+        if new is not None:
+            out[f"{node}:{new}"] = cnt
+    return out
+
+
 @app.delete("/api/runs/{thread_id}/chapter/{idx}")
 def delete_chapter(thread_id: str, idx: int):
     """#7: удалить главу и переиндексировать остальные."""
@@ -868,10 +925,20 @@ def delete_chapter(thread_id: str, idx: int):
     chapters.pop(idx)
     for i, ch in enumerate(chapters):
         ch.index = i
+    # курсор «какую главу пишем следующей» должен указывать на ТУ ЖЕ главу:
+    # удалили главу ДО курсора → курсор сдвигается на -1 (иначе пропуск главы)
     cur = st.get("chapter_idx", 0)
-    patch = {"chapters": chapters}
-    if cur >= len(chapters):
-        patch["chapter_idx"] = len(chapters) - 1
+    new_cur = cur - 1 if idx < cur else cur
+    new_cur = max(0, min(new_cur, len(chapters) - 1))
+    # незавершённая ревизия привязана к индексу — после сдвига попала бы в чужую
+    # главу, поэтому сбрасываем
+    patch = {"chapters": chapters,
+             "revision_target": None, "revision_feedback": None}
+    rc = _remap_retry(st, lambda n: None if n == idx else (n - 1 if n > idx else n))
+    if rc is not None:
+        patch["retry_count"] = rc
+    if new_cur != cur:
+        patch["chapter_idx"] = new_cur
     _patch(thread_id, run, patch)
     run.structure_dirty = True
     run.events.put({"type": "edited", "keys": ["chapters"]})
@@ -895,7 +962,19 @@ def reorder_chapters(thread_id: str, req: ReorderReq):
     new = [chapters[i] for i in req.order]
     for i, ch in enumerate(new):
         ch.index = i
-    _patch(thread_id, run, {"chapters": new})
+    patch: dict[str, Any] = {"chapters": new,
+                             "revision_target": None,
+                             "revision_feedback": None}
+    rc = _remap_retry(st, lambda n: req.order.index(n) if n in req.order else None)
+    if rc is not None:
+        patch["retry_count"] = rc
+    # курсор следует за СВОЕЙ главой на её новое место
+    cur = st.get("chapter_idx", 0)
+    if 0 <= cur < len(req.order):
+        new_cur = req.order.index(cur)
+        if new_cur != cur:
+            patch["chapter_idx"] = new_cur
+    _patch(thread_id, run, patch)
     run.events.put({"type": "edited", "keys": ["chapters"]})
     return {"ok": True}
 
@@ -920,7 +999,19 @@ def move_chapter(thread_id: str, idx: int, req: MoveReq):
     chapters[idx], chapters[j] = chapters[j], chapters[idx]
     for i, ch in enumerate(chapters):
         ch.index = i
-    _patch(thread_id, run, {"chapters": chapters})
+    patch: dict[str, Any] = {"chapters": chapters,
+                             "revision_target": None,
+                             "revision_feedback": None}
+    rc = _remap_retry(st, lambda n: j if n == idx else (idx if n == j else n))
+    if rc is not None:
+        patch["retry_count"] = rc
+    # курсор следует за своей главой при свопе
+    cur = st.get("chapter_idx", 0)
+    if cur == idx:
+        patch["chapter_idx"] = j
+    elif cur == j:
+        patch["chapter_idx"] = idx
+    _patch(thread_id, run, patch)
     run.events.put({"type": "edited", "keys": ["chapters"]})
     return {"ok": True, "moved_to": j}
 
@@ -1453,10 +1544,15 @@ def _revision_worker(run: Run, idx: int, to_fix: list, convo: str):
         chapters = list(st.get("chapters") or [])
         if to_fix or convo.strip():
             # 1-2) ТОЧЕЧНАЯ правка (не перегенерация)
+            convo = nodes.to_english(convo)  # RU-обсуждение → EN для агента
             st["chapter_idx"] = idx
             ch = nodes.patch_chapter(st, chapters[idx], idx, to_fix, extra=convo)
+            if run.cancel:  # «Стоп» во время правки — правку не записываем
+                raise _Cancelled()
             chapters[idx] = ch
             _patch(thread_id, run, {"chapters": chapters})
+        if run.cancel:  # «Стоп» — перепроверку не запускаем
+            raise _Cancelled()
         # 3) перепроверить → новый раунд редактора
         st2 = _state(thread_id)
         st2["chapter_idx"] = idx
@@ -1465,6 +1561,10 @@ def _revision_worker(run: Run, idx: int, to_fix: list, convo: str):
         run.status = "paused"
         run.events.put({"type": "edited",
                         "keys": ["chapters", "editor_reports"]})
+        run.events.put({"type": "status", "status": "paused"})
+    except _Cancelled:
+        run.cancel = False
+        run.status = "paused"
         run.events.put({"type": "status", "status": "paused"})
     except LLMLimitError as exc:  # #5: лимит → баннер выбора, прогресс цел
         run.limit = {"provider": exc.provider, "reset_at": exc.reset_at,
@@ -1511,10 +1611,19 @@ def apply_revision(thread_id: str, idx: int, req: RevisionReq):
     if not to_fix and not convo_raw.strip():
         return {"ok": True, "started": False,
                 "note": "нечего чинить — все замечания уже закрыты"}
-    convo = nodes.to_english(convo_raw)  # обсуждение на русском → EN для агента
-    run.worker = threading.Thread(
-        target=_revision_worker, args=(run, idx, to_fix, convo), daemon=True)
-    run.worker.start()
+    # СИНХРОННО running до старта потока — иначе немедленный poll фронта ловит
+    # старый «paused» и перестаёт поллить (та же гонка, что была в _bg_op).
+    # Перевод RU→EN — внутри воркера: это LLM-вызов, ему не место в HTTP-запросе.
+    with _LOCK:  # TOCTOU: двойной клик «Исправить всё» → два воркера
+        if run.worker and run.worker.is_alive():
+            raise HTTPException(409, "run is busy")
+        run.cancel = False
+        run.status = "running"
+        run.error = ""
+        run.worker = threading.Thread(
+            target=_revision_worker, args=(run, idx, to_fix, convo_raw),
+            daemon=True)
+        run.worker.start()
     return {"ok": True, "started": True}
 
 

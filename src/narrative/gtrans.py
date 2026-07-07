@@ -49,7 +49,9 @@ NAME_BY_CODE: dict[str, str] = {code: name for code, name, _tl in LANGUAGES}
 TARGET_CODES: list[str] = [code for code, _n, _t in LANGUAGES if code != "en"]
 
 
-def _chunks(text: str, limit: int = 4500) -> list[str]:
+def _chunks(text: str, limit: int = 1800) -> list[str]:
+    # 1800 сырых символов: после percent-encoding (кавычки-ёлочки, тире, юникод
+    # ×3-9 байт) URL остаётся в пределах ~8КБ лимита прокси/балансировщиков
     """Бьём текст на куски < limit символов по границам строк (лимит запроса)."""
     out: list[str] = []
     buf = ""

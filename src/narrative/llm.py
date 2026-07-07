@@ -246,10 +246,19 @@ _CTRL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 def _extract_json(raw: str) -> str:
     """Достаёт JSON, даже если модель обернула его в ```json-ограждение,
-    и вычищает управляющие символы (иначе валидация падает на \\u0000 и т.п.)."""
-    fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", raw, re.DOTALL)
-    if fenced:
-        return _CTRL_CHARS.sub("", fenced.group(1))
+    и вычищает управляющие символы (иначе валидация падает на \\u0000 и т.п.).
+
+    Fenced-блоки перебираем ВСЕ и берём первый, который реально парсится как
+    JSON — модель порой цитирует пример/схему в первом ограждении, а настоящий
+    ответ кладёт во второе."""
+    import json as _json  # noqa: PLC0415
+    for m in re.finditer(r"```(?:json)?\s*(.+?)\s*```", raw, re.DOTALL):
+        cand = _CTRL_CHARS.sub("", m.group(1))
+        try:
+            _json.loads(cand)
+            return cand
+        except ValueError:
+            continue  # не JSON (пример кода и т.п.) → смотрим следующий блок
     # иначе берём от первой { до последней }
     start = raw.find("{")
     end = raw.rfind("}")

@@ -188,10 +188,12 @@ export const genChapterPlan = (id: string, idx: number) =>
 // пропустить выбор объёма/структуру → создать один пустой черновик
 export const manualStructure = (id: string) =>
   jpost(`/api/runs/${id}/structure/manual`);
-// #7: удалить главу
-export const deleteChapter = (id: string, idx: number) =>
-  fetch(`${API_BASE}/api/runs/${id}/chapter/${idx}`, { method: "DELETE" })
-    .then((r) => { if (!r.ok) throw new Error(`del failed: ${r.status}`); return r.json(); });
+// #7: удалить главу (через parseJsonSafe — единый разбор ошибок/пустых ответов)
+export const deleteChapter = async (id: string, idx: number) => {
+  const url = `/api/runs/${id}/chapter/${idx}`;
+  const r = await fetch(`${API_BASE}${url}`, { method: "DELETE" });
+  return parseJsonSafe(r, url);
+};
 // #6: двигать главу вверх/вниз (меняет порядок и переиндексирует)
 export const moveChapter = (id: string, idx: number, dir: "up" | "down") =>
   jpost(`/api/runs/${id}/chapter/${idx}/move`, { dir });
