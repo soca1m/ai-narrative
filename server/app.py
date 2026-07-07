@@ -1715,12 +1715,28 @@ def export_project_docx(thread_id: str):
         raise HTTPException(
             501, "python-docx не установлен на сервере — обнови зависимости "
                  "(pip install -r requirements.txt / пересобери Docker)")
+    from docx.oxml import OxmlElement  # noqa: PLC0415
+    from docx.oxml.ns import qn  # noqa: PLC0415
     st = _state(thread_id)
     chapters = list(st.get("chapters") or [])
 
     from narrative import gtrans  # noqa: PLC0415
     # Группировка ПО ЯЗЫКАМ: заголовок языка (level 1), под ним все главы (level 2).
     doc = Document()
+
+    def _add_body(body: str) -> None:
+        """Текст главы ОДНИМ параграфом: строки через <w:br/> внутри одного run.
+        При параграфе-на-строку (8 глав × 27 языков × ~500 строк ≈ 100k+ вызовов
+        add_paragraph) сборка висла минутами и валила прокси по таймауту (500)."""
+        p = doc.add_paragraph()
+        r = p.add_run()._r
+        for j, ln in enumerate(body.split("\n")):
+            if j:
+                r.append(OxmlElement("w:br"))
+            t = OxmlElement("w:t")
+            t.text = ln
+            t.set(qn("xml:space"), "preserve")
+            r.append(t)
 
     def _lang_section(lang_label: str, get_text) -> None:
         bodies = [(ch, (get_text(ch) or "").strip()) for ch in chapters]
@@ -1731,8 +1747,7 @@ def export_project_docx(thread_id: str):
             if not body:
                 continue
             doc.add_heading(f"Глава {ch.index + 1}. {ch.title}", level=2)
-            for line in body.split("\n"):
-                doc.add_paragraph(line)
+            _add_body(body)
 
     _lang_section("English (оригинал)", lambda ch: ch.dialogue)
     for code in gtrans.TARGET_CODES:
