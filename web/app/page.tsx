@@ -607,8 +607,10 @@ export default function Page() {
       if (fmt === "docx") { await downloadDocx(threadId); return; }
       const r = await exportProject(threadId, fmt);
       downloadText(r.filename, r.text);
-    } catch {
-      setErr("Не удалось собрать проект для скачивания");
+    } catch (e) {
+      setErr(e instanceof Error && e.message
+        ? `Не удалось собрать проект: ${e.message}`
+        : "Не удалось собрать проект для скачивания");
     }
   }
 

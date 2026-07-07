@@ -1499,12 +1499,19 @@ def apply_revision(thread_id: str, idx: int, req: RevisionReq):
     if last is None:
         raise HTTPException(400, "по этой главе ещё нет отчёта редактора")
     to_fix = _open_findings(last)
-    convo = "\n".join(
+    convo_raw = "\n".join(
         f"{'Нарративщик' if m.get('role') == 'user' else 'ИИ'}: "
         f"{m.get('content', '')}"
         for m in (req.messages or []) if m.get("role") in ("user", "assistant")
     )
-    convo = nodes.to_english(convo)  # обсуждение на русском → EN для агента
+    # Нечего чинить (все замечания отклонены/закрыты) и обсуждения нет — НЕ
+    # перезапускаем редактора вхолостую. Иначе свежий прогон editor_node может
+    # придумать новые/повторные замечания и отправить главу на ревизию заново,
+    # хотя нарративщик уже всё отклонил (баг: шаг 3 раньше вызывался безусловно).
+    if not to_fix and not convo_raw.strip():
+        return {"ok": True, "started": False,
+                "note": "нечего чинить — все замечания уже закрыты"}
+    convo = nodes.to_english(convo_raw)  # обсуждение на русском → EN для агента
     run.worker = threading.Thread(
         target=_revision_worker, args=(run, idx, to_fix, convo), daemon=True)
     run.worker.start()
@@ -1701,7 +1708,13 @@ def export_project(thread_id: str, fmt: str = "txt"):
 def export_project_docx(thread_id: str):
     """Собрать новеллу в .docx (бинарь) — заголовки глав + текст + перевод."""
     import io  # noqa: PLC0415
-    from docx import Document  # noqa: PLC0415
+    try:
+        from docx import Document  # noqa: PLC0415
+    except ImportError:
+        # деплой без зависимости → 501 с понятным текстом, а не голый 500
+        raise HTTPException(
+            501, "python-docx не установлен на сервере — обнови зависимости "
+                 "(pip install -r requirements.txt / пересобери Docker)")
     st = _state(thread_id)
     chapters = list(st.get("chapters") or [])
 

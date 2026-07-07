@@ -300,7 +300,15 @@ export const exportProject = (
 // скачать .docx (бинарь) — фетчим blob и триггерим загрузку в браузере
 export async function downloadDocx(id: string): Promise<void> {
   const r = await fetch(`${API_BASE}/api/runs/${id}/export.docx`);
-  if (!r.ok) throw new Error(`docx export failed: ${r.status}`);
+  if (!r.ok) {
+    // вытащить понятный detail из FastAPI-ошибки (напр. «python-docx не установлен»)
+    let detail = "";
+    try {
+      const j = await r.json();
+      detail = (j && (j.detail?.message || j.detail || j.error)) || "";
+    } catch { /* не JSON */ }
+    throw new Error(detail || `Скачивание .docx не удалось (HTTP ${r.status})`);
+  }
   const blob = await r.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
