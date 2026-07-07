@@ -312,6 +312,8 @@ export default function Page() {
   // dev-оверрайды промптов ДО старта (применятся с первого бота)
   const [preOverrides, setPreOverrides] = useState<Record<string, string>>({});
   const [structureDirty, setStructureDirty] = useState(false);
+  // индикатор скачивания (сборка docx/txt на бэке может занять секунды)
+  const [dl, setDl] = useState<null | "txt" | "md" | "docx">(null);
 
   // список прошлых работ (продолжить оборванную / скачать)
   const [runs, setRuns] = useState<RunSummary[]>([]);
@@ -602,7 +604,8 @@ export default function Page() {
   const projectDone = status === "done";
 
   async function onDownload(fmt: "txt" | "md" | "docx") {
-    if (!threadId) return;
+    if (!threadId || dl) return;
+    setDl(fmt);
     try {
       if (fmt === "docx") { await downloadDocx(threadId); return; }
       const r = await exportProject(threadId, fmt);
@@ -611,7 +614,7 @@ export default function Page() {
       setErr(e instanceof Error && e.message
         ? `Не удалось собрать проект: ${e.message}`
         : "Не удалось собрать проект для скачивания");
-    }
+    } finally { setDl(null); }
   }
 
   // единый перехват ошибок действий: показываем в баннере, НЕ роняем UI.
@@ -885,10 +888,14 @@ export default function Page() {
                   редактором. Можно скачать готовый текст новеллы.
                 </div>
                 <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
-                  <button onClick={() => onDownload("docx")}><Download size={16} /> Скачать .docx</button>
-                  <button className="secondary" onClick={() => onDownload("txt")}><Download size={16} /> Скачать .txt</button>
-                  <button className="secondary" onClick={() => onDownload("md")}>
-                    <Download size={16} /> Скачать .md
+                  <button disabled={dl !== null} onClick={() => onDownload("docx")}>
+                    {dl === "docx" ? <><Loader2 size={16} className="spin" /> Собираю…</> : <><Download size={16} /> Скачать .docx</>}
+                  </button>
+                  <button className="secondary" disabled={dl !== null} onClick={() => onDownload("txt")}>
+                    {dl === "txt" ? <><Loader2 size={16} className="spin" /> Собираю…</> : <><Download size={16} /> Скачать .txt</>}
+                  </button>
+                  <button className="secondary" disabled={dl !== null} onClick={() => onDownload("md")}>
+                    {dl === "md" ? <><Loader2 size={16} className="spin" /> Собираю…</> : <><Download size={16} /> Скачать .md</>}
                   </button>
                 </div>
               </motion.div>
@@ -985,6 +992,7 @@ export default function Page() {
               onRefresh={refresh}
               busy={busy}
               canDownload={allWritten}
+              downloading={dl !== null}
               onDownload={onDownload}
               chapters={st.chapters ?? []}
               reports={reports}
@@ -1355,6 +1363,7 @@ function Chapters(props: {
   writingIdx?: number | null; writingText?: string;
   chapters: Chapter[]; reports: EditorReport[];
   canDownload?: boolean;
+  downloading?: boolean;
   onDownload?: (fmt: "txt" | "md" | "docx") => void;
   onSaveAll: (chs: Chapter[]) => void;
   onReviseChapter: (i: number, fb: string) => Promise<void>;
@@ -1474,8 +1483,13 @@ function Chapters(props: {
         Главы · структура → диалоги+адалт → редактор
         <span className="row" style={{ marginLeft: "auto", gap: 8 }}>
           {props.canDownload && props.onDownload && (
-            <button className="small ghost" disabled={props.busy} onClick={() => props.onDownload!("docx")}
-              title="Скачать новеллу в .docx"><Download size={14} /> Скачать .docx</button>
+            <button className="small ghost" disabled={props.busy || props.downloading}
+              onClick={() => props.onDownload!("docx")}
+              title="Скачать новеллу в .docx">
+              {props.downloading
+                ? <><Loader2 size={14} className="spin" /> Собираю…</>
+                : <><Download size={14} /> Скачать .docx</>}
+            </button>
           )}
           {props.rollbackStage === "dialogue" && (
             <button className="small ghost" disabled={props.busy} onClick={props.onRollbackWriting}
