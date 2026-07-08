@@ -87,6 +87,10 @@ async function parseJsonSafe<T = any>(r: Response, url: string): Promise<T> {
   let data: any = null;
   try { data = text ? JSON.parse(text) : null; } catch { /* не JSON */ }
   if (!r.ok) {
+    // 409 = «run is busy»: не техношум, а нормальная ситуация — ИИ ещё занят
+    if (r.status === 409) {
+      throw new Error("ИИ ещё выполняет предыдущую задачу — дождись окончания и попробуй снова");
+    }
     const detail = (data && (data.detail?.message || data.detail || data.error))
       || (text ? text.slice(0, 160) : "");
     throw new Error(`${url}: ${r.status}${detail ? ` — ${detail}` : ""}`);

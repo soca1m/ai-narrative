@@ -1357,11 +1357,13 @@ def project_apply(thread_id: str, req: ProjectApplyReq):
     if req.target not in _APPLY_TARGETS:
         raise HTTPException(400, f"bad target {req.target}")
     st = _state(thread_id)
-    convo = nodes.to_english("\n".join(
+    # to_english — LLM-вызов: НЕ в HTTP-запросе (сбой/лимит давал голый 500,
+    # длинный чат — таймаут прокси), переводим внутри фонового _op
+    convo_raw = "\n".join(
         f"{'Нарративщик' if m.get('role') == 'user' else 'ИИ'}: "
         f"{m.get('content', '')}"
         for m in (req.messages or []) if m.get("role") in ("user", "assistant")
-    ))
+    )
 
     labels = {"synopsis": "СИНОПСИС", "characters": "КАРТОЧКИ ПЕРСОНАЖЕЙ",
               "locations": "КАРТОЧКИ ЛОКАЦИЙ", "logline": "ЛОГЛАЙН",
@@ -1385,10 +1387,10 @@ def project_apply(thread_id: str, req: ProjectApplyReq):
         + prompts.NAMES_RULE + prompts.CONTENT_POLICY
         + "\n\nКОНТЕКСТ ПРОЕКТА:\n" + _project_context(st)
     )
-    user = (f"ТЕКУЩЕЕ содержимое ({labels[req.target]}):\n{cur}\n\n"
-            f"Обсуждение правок:\n{convo}\n\nВыдай новый текст.")
-
     def _op():
+        convo = nodes.to_english(convo_raw)
+        user = (f"ТЕКУЩЕЕ содержимое ({labels[req.target]}):\n{cur}\n\n"
+                f"Обсуждение правок:\n{convo}\n\nВыдай новый текст.")
         new = nodes._structural(st, None).complete(system, user)
         if req.target in ("chapter_plan", "chapter_dialogue"):
             chs = list(_state(thread_id).get("chapters") or [])
@@ -1444,11 +1446,13 @@ def project_apply_auto(thread_id: str, req: ProjectChatReq):
     run = _get_run(thread_id)
     _busy(run)
     st = _state(thread_id)
-    convo = nodes.to_english("\n".join(
+    # to_english — LLM-вызов: НЕ в HTTP-запросе (голый 500 при сбое/лимите,
+    # таймаут прокси на длинном чате) → переводим внутри фонового _op
+    convo_raw = "\n".join(
         f"{'Нарративщик' if m.get('role') == 'user' else 'ИИ'}: "
         f"{m.get('content', '')}"
         for m in (req.messages or []) if m.get("role") in ("user", "assistant")
-    ))
+    )
     system = (
         "Ты — ассистент-сценарист 18+. По итогу обсуждения реши, какой ОДИН "
         "результат бота нужно изменить (синопсис, персонажи, локации, логлайн, "
@@ -1459,9 +1463,10 @@ def project_apply_auto(thread_id: str, req: ProjectChatReq):
         + prompts.NAMES_RULE + prompts.CONTENT_POLICY
         + "\n\nКОНТЕКСТ ПРОЕКТА:\n" + _project_context(st)
     )
-    user = f"Обсуждение:\n{convo}\n\nРеши, что изменить, и выдай новый текст."
 
     def _op():
+        convo = nodes.to_english(convo_raw)
+        user = f"Обсуждение:\n{convo}\n\nРеши, что изменить, и выдай новый текст."
         out = nodes._structural(st, None).structured(
             system, user, ProjectAutoEdit, temperature=0.3)
         if not out.changed or out.target == "none" or not out.new_content.strip():
