@@ -965,8 +965,13 @@ def sync_plan_from_dialogue(state: State, ch: Chapter, idx: int) -> str:
 
 @_stream_node("dialogue")
 def dialogue_node(state: State) -> dict:
-    idx = state["chapter_idx"]
-    chapters = list(state["chapters"])
+    chapters = list(state.get("chapters") or [])
+    if not chapters:  # защита: главы не сгенерированы — не падаем на индексации
+        return {"log": ["⚠ Написание глав: глав нет — сначала сгенерируй "
+                        "структуру (откат на этап «Структура»)"]}
+    # курсор мог слететь в None/за границу (откаты, ручные правки) → чиним
+    idx = state.get("chapter_idx")
+    idx = 0 if idx is None else max(0, min(idx, len(chapters) - 1))
     ch = chapters[idx]
     is_revision = (state.get("revision_target") == "dialogue"
                    and bool(state.get("revision_feedback")))
@@ -986,6 +991,7 @@ def dialogue_node(state: State) -> dict:
     tag = " (с адалтом)" if ch.is_adult_point else ""
     return {
         "chapters": chapters,
+        "chapter_idx": idx,  # фиксируем починенный курсор (был None/за границей)
         "revision_feedback": None,
         "revision_target": None,
         "log": [f"✓ Бот 5: глава {idx + 1} «{ch.title}» {verb}{tag}"],
@@ -1119,8 +1125,12 @@ def editor_node(state: State) -> dict:
     findings получают стабильный id и наследуют решения нарративщика
     (accepted/rejected/комментарий) из finding_decisions.
     """
-    idx = state["chapter_idx"]
-    ch = state["chapters"][idx]
+    chapters = list(state.get("chapters") or [])
+    if not chapters:
+        return {"log": ["⚠ Редактор: глав нет, пропуск"]}
+    idx = state.get("chapter_idx")
+    idx = 0 if idx is None else max(0, min(idx, len(chapters) - 1))
+    ch = chapters[idx]
 
     full_text = ch.dialogue or ""
     if ch.adult_scene:

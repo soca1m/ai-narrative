@@ -105,6 +105,7 @@ def _patch_llms():
     nodes._structural = lambda *a, **k: FakeLLM()
     nodes._editor = lambda *a, **k: FakeLLM()
     nodes._adult = lambda *a, **k: FakeLLM()
+    nodes._translator = lambda *a, **k: FakeLLM()  # haiku-фолбэк перевода
 
 
 # ----------------------------- тест A: граф -----------------------------

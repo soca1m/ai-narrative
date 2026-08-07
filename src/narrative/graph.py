@@ -24,7 +24,12 @@ from .state import State
 
 
 def _is_adult_chapter(state: State) -> bool:
-    return bool(state["chapters"][state["chapter_idx"]].is_adult_point)
+    chs = state.get("chapters") or []
+    if not chs:
+        return False
+    idx = state.get("chapter_idx")
+    idx = 0 if idx is None else max(0, min(idx, len(chs) - 1))
+    return bool(chs[idx].is_adult_point)
 
 
 def _critical_count(report) -> int:
@@ -37,7 +42,7 @@ def _critical_count(report) -> int:
 
 def _after_editor(state: State) -> str:
     """Условное ребро после редактора: правка / следующая глава / перевод."""
-    idx = state["chapter_idx"]
+    idx = state.get("chapter_idx") or 0
     # ТОЛЬКО отчёты ЭТОЙ главы: в общий список могли вклиниться отчёты других
     # глав (ручной apply_revision во время паузы) — сравнение прогресса по
     # хвосту всего списка сравнивало бы чужие главы.
@@ -117,7 +122,8 @@ def _after_structure(state: State) -> str:
 
 def _advance_or_finish(state: State) -> str:
     """После успешной главы: следующая глава или перевод."""
-    if state["chapter_idx"] + 1 < len(state["chapters"]):
+    idx = state.get("chapter_idx") or 0
+    if idx + 1 < len(state.get("chapters") or []):
         return "next_chapter"
     return "translation"
 
@@ -133,7 +139,7 @@ def _set_revision(target: str):
 
 
 def _next_chapter(state: State) -> dict:
-    return {"chapter_idx": state["chapter_idx"] + 1}
+    return {"chapter_idx": (state.get("chapter_idx") or 0) + 1}
 
 
 def sqlite_saver(path: str | None = None) -> SqliteSaver:

@@ -806,7 +806,7 @@ def add_chapter(thread_id: str, req: AddChapterReq):
         rc = _remap_retry(st, lambda n: n + 1 if n >= pos else n)
         if rc is not None:
             patch["retry_count"] = rc
-        cur = st.get("chapter_idx", 0)
+        cur = st.get("chapter_idx") or 0
         if pos <= cur:
             patch["chapter_idx"] = cur + 1
         return patch
@@ -927,7 +927,7 @@ def delete_chapter(thread_id: str, idx: int):
         ch.index = i
     # курсор «какую главу пишем следующей» должен указывать на ТУ ЖЕ главу:
     # удалили главу ДО курсора → курсор сдвигается на -1 (иначе пропуск главы)
-    cur = st.get("chapter_idx", 0)
+    cur = st.get("chapter_idx") or 0
     new_cur = cur - 1 if idx < cur else cur
     new_cur = max(0, min(new_cur, len(chapters) - 1))
     # незавершённая ревизия привязана к индексу — после сдвига попала бы в чужую
@@ -969,7 +969,7 @@ def reorder_chapters(thread_id: str, req: ReorderReq):
     if rc is not None:
         patch["retry_count"] = rc
     # курсор следует за СВОЕЙ главой на её новое место
-    cur = st.get("chapter_idx", 0)
+    cur = st.get("chapter_idx") or 0
     if 0 <= cur < len(req.order):
         new_cur = req.order.index(cur)
         if new_cur != cur:
@@ -1006,7 +1006,7 @@ def move_chapter(thread_id: str, idx: int, req: MoveReq):
     if rc is not None:
         patch["retry_count"] = rc
     # курсор следует за своей главой при свопе
-    cur = st.get("chapter_idx", 0)
+    cur = st.get("chapter_idx") or 0
     if cur == idx:
         patch["chapter_idx"] = j
     elif cur == j:
@@ -1049,15 +1049,19 @@ def skip_structure_stage(thread_id: str):
     run = _get_run(thread_id)
     _busy(run)
     run.structure_dirty = False
+    # курсор на первую главу, если сбит (иначе написание падало на chapters[None])
+    st = _state(thread_id)
+    cur = st.get("chapter_idx")
+    fix_cur = {"chapter_idx": 0} if cur is None else {}
     # помечаем узел выполненным без правок → граф идёт к следующему шагу (главы).
     # Фолбэк: если граф не на узле проверки — ставим одноразовый флаг пропуска,
     # тогда узел отработает вхолостую (без 500 и без перезаписи плана).
     try:
         _patch(thread_id, run, {"structure_fixes": [],
-                                "skip_structure_check": True},
+                                "skip_structure_check": True, **fix_cur},
                as_node="structure_editor")
     except Exception:  # noqa: BLE001
-        _patch(thread_id, run, {"skip_structure_check": True})
+        _patch(thread_id, run, {"skip_structure_check": True, **fix_cur})
     return resume_run(thread_id)
 
 
