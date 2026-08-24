@@ -75,7 +75,10 @@ ROLLBACK = {
     "synopsis":   ("logline",    ["synopsis", "characters", "locations", "chapters", "chapter_idx", "structure_done"]),
     "characters": ("synopsis",   ["characters", "locations", "chapters", "chapter_idx", "structure_done"]),
     "locations":  ("characters", ["locations", "chapters", "chapter_idx", "structure_done"]),
-    "structure":  ("characters", ["chapters", "chapter_idx", "structure_done"]),
+    # as_node="chapter_count": следующий узел — СРАЗУ structure. Раньше стоял
+    # "characters" → граф уезжал на перегенерацию ЛОКАЦИЙ (репорт Shadowpast:
+    # «стёрла главы и откатилась до генерации локаций»).
+    "structure":  ("chapter_count", ["chapters", "chapter_idx", "structure_done"]),
     "dialogue":   ("structure",  ["chapter_idx"]),  # перезапуск написания глав с 0
 }
 
@@ -248,7 +251,7 @@ def _serialize(values: dict) -> dict:
     out: dict[str, Any] = {}
     for key, val in values.items():
         if key == "chapters":
-            out[key] = [c.model_dump() for c in val]
+            out[key] = [c.model_dump() for c in (val or [])]
         elif key == "editor_reports":
             out[key] = [_report_ru(apply_decisions(r, decisions).model_dump())
                         for r in val]
@@ -1602,6 +1605,12 @@ def apply_revision(thread_id: str, idx: int, req: RevisionReq):
     _busy(run)
     st = _state(thread_id)
     chapters = list(st.get("chapters") or [])
+    if not chapters:
+        # главы стёрты откатом, а фронт ещё показывал панель правок по старым
+        # отчётам (кейс Shadowpast) → объясняем по-человечески, не «bad index»
+        raise HTTPException(400, "Глав сейчас нет — был откат этапа. Сгенерируй "
+                                 "структуру заново (кнопка «Продолжить»), потом "
+                                 "возвращайся к правкам")
     if idx < 0 or idx >= len(chapters):
         raise HTTPException(400, "bad chapter index")
     last = _last_report(st, idx)
@@ -1656,11 +1665,12 @@ def rollback(thread_id: str, req: RollbackReq):
             c.adult_statics, c.adult_anims = [], []
         # фаза заново «content»: сначала весь контент, редактор потом
         patch = {"chapters": chs, "chapter_idx": 0, "phase": "content"}
-    elif req.stage in ("structure", "characters", "synopsis"):
+    elif req.stage in ("structure", "characters", "synopsis", "locations"):
         patch["chapters"] = []  # очистить главы (не-reducer)
-    if req.stage in ("structure", "characters", "synopsis"):
+    if req.stage in ("structure", "characters", "synopsis", "locations"):
         patch["structure_done"] = False
         patch["phase"] = None
+        patch["manual_chapters"] = False  # откат = явная регенерация структуры
     _patch(thread_id, run, patch, as_node=as_node)
     # откат снимает «done/error» — встаём на паузу на откатанном этапе, чтобы в
     # UI появилась кнопка «Продолжить», а не висел финальный экран «Проект готов».

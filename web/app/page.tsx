@@ -606,7 +606,8 @@ export default function Page() {
     : 0;
   // gate: на паузе текущая глава проверена и остались открытые замечания.
   // Переход к следующей главе блокируется, пока их не закрыть (исправить/отклонить).
-  const gating = status === "paused" && curEdited && curOpenAll > 0;
+  const gating = status === "paused" && curEdited && curOpenAll > 0
+    && (st.chapters?.length ?? 0) > 0;  // после отката глав нет — гейт прячем
 
   // проект готов: граф дошёл до конца (перевод/END). Все главы написаны →
   // можно скачивать в любой момент. Готовность снимает «ощущение бесконечности».
@@ -1015,7 +1016,7 @@ export default function Page() {
               onSyncPlan={(i) => guard(async () => { if (threadId) { await syncPlan(threadId, i); refresh(); } })}
               rollbackStage={currentStage === "dialogue" ? "dialogue" : currentStage === "structure" ? "structure" : null}
               onRollbackWriting={() => guard(async () => { if (threadId && confirm("Откатить этап написания: удалить все тексты глав (диалоги/адалт/перевод) и сгенерировать заново? План глав сохранится.")) { await rollback(threadId, "dialogue"); refresh(); } })}
-              onRollbackStructure={() => guard(async () => { if (threadId && confirm("Откатить этап структуры: удалить план глав и сгенерировать заново?")) { await rollback(threadId, "structure"); refresh(); } })}
+              onRollbackStructure={() => guard(async () => { if (threadId && confirm("Откатить этап структуры: удалить план И ТЕКСТЫ всех глав и сгенерировать структуру заново?")) { await rollback(threadId, "structure"); refresh(); } })}
               onDecide={(fid, body) => guard(async () => { if (threadId) { await decideFinding(threadId, fid, body); refresh(); } })}
               onAdaptAdult={(i) => guard(async () => { if (threadId) { await adaptAdult(threadId, i); refresh(); } })}
               onSkipAdult={(i) => guard(async () => { if (threadId) { await skipAdult(threadId, i); refresh(); } })}
@@ -1028,7 +1029,7 @@ export default function Page() {
               value={drafts.locations ?? ""} dirty={dirty.has("locations")} saved={saved === "locations"}
               onChange={(v) => edit("locations", v)} onSave={() => save("locations")}
               onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "locations", fb); setStatus("running"); poll(threadId); } })}
-              onRollback={currentStage === "locations" ? () => guard(async () => { if (threadId && confirm("Откатить этап локаций: удалить карточки локаций и сгенерировать заново?")) { await rollback(threadId, "locations"); refresh(); } }) : undefined}
+              onRollback={currentStage === "locations" ? () => guard(async () => { if (threadId && confirm("Откатить этап локаций: удалить карточки локаций И ВСЕ ГЛАВЫ (план и тексты) и сгенерировать заново?")) { await rollback(threadId, "locations"); refresh(); } }) : undefined}
             />
 
             {/* Персонажи */}
@@ -1038,7 +1039,7 @@ export default function Page() {
               value={drafts.characters ?? ""} dirty={dirty.has("characters")} saved={saved === "characters"}
               onChange={(v) => edit("characters", v)} onSave={() => save("characters")}
               onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "characters", fb); setStatus("running"); poll(threadId); } })}
-              onRollback={currentStage === "characters" ? () => guard(async () => { if (threadId && confirm("Откатить этап персонажей: удалить карточки и сгенерировать заново?")) { await rollback(threadId, "characters"); refresh(); } }) : undefined}
+              onRollback={currentStage === "characters" ? () => guard(async () => { if (threadId && confirm("Откатить этап персонажей: удалить карточки, локации И ВСЕ ГЛАВЫ и сгенерировать заново?")) { await rollback(threadId, "characters"); refresh(); } }) : undefined}
             />
 
             {/* Синопсис */}
@@ -1048,7 +1049,7 @@ export default function Page() {
               value={drafts.synopsis ?? ""} dirty={dirty.has("synopsis")} saved={saved === "synopsis"}
               onChange={(v) => edit("synopsis", v)} onSave={() => save("synopsis")}
               onRevise={(fb) => guard(async () => { if (threadId) { await reviseStage(threadId, "synopsis", fb); setStatus("running"); poll(threadId); } })}
-              onRollback={currentStage === "synopsis" ? () => guard(async () => { if (threadId && confirm("Откатить этап синопсиса: удалить синопсис и сгенерировать заново?")) { await rollback(threadId, "synopsis"); refresh(); } }) : undefined}
+              onRollback={currentStage === "synopsis" ? () => guard(async () => { if (threadId && confirm("Откатить этап синопсиса: удалить синопсис, персонажей, локации И ВСЕ ГЛАВЫ и сгенерировать заново?")) { await rollback(threadId, "synopsis"); refresh(); } }) : undefined}
             />
 
             {/* Логлайн — выбор одного из вариантов */}
