@@ -11,9 +11,10 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Код пайплайна и сервера.
+# Код пайплайна и сервера + сервисные скрипты (restore_chapters и т.п.).
 COPY src/ ./src/
 COPY server/ ./server/
+COPY scripts/ ./scripts/
 
 # src/narrative импортируется как пакет narrative.
 ENV PYTHONPATH=/app/src \
